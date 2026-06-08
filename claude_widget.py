@@ -247,7 +247,7 @@ BTN_BG_HOVER = "#3a3a3a"
 TIME_BAR_BG  = "#262626"   # slightly darker than BAR_BG
 TIME_BAR_FG  = "#999999"   # quiet light gray
 BAR_H        = 5
-TIME_BAR_H   = 3            # roughly half of BAR_H
+TIME_BAR_H   = 2            # slim accent under the usage bar
 WIDTH        = 220
 
 # Discrete refresh-timer presets, in minutes.
@@ -549,14 +549,16 @@ class UsageWidget(tk.Tk):
 
         if self._manage_mode:
             box = tk.Label(top, text="☐" if hidden else "☑", bg=BG, fg=active_fg,
-                           font=("Segoe UI", 9), cursor="hand2")
+                           font=("Segoe UI", 9), cursor="hand2",
+                           bd=0, padx=0, pady=0)
             box.pack(side="left", padx=(0, 4))
             box.bind("<Button-1>", lambda _e, l=label: self._toggle_hidden(l))
 
         tk.Label(top, text=label, bg=BG, fg=active_fg,
-                 font=("Segoe UI", 8)).pack(side="left")
+                 font=("Segoe UI", 8), bd=0, padx=0, pady=0).pack(side="left")
         tk.Label(top, text=f"{pct}%", bg=BG, fg=active_bar,
-                 font=("Segoe UI", 8, "bold")).pack(side="right")
+                 font=("Segoe UI", 8, "bold"),
+                 bd=0, padx=0, pady=0).pack(side="right")
 
         # Usage bar
         usage_bar = tk.Frame(row, bg=BAR_BG, height=BAR_H)
@@ -577,7 +579,8 @@ class UsageWidget(tk.Tk):
 
         if sub:
             tk.Label(row, text=sub, bg=BG, fg=FG_DIM,
-                     font=("Segoe UI", 7)).pack(anchor="w")
+                     font=("Segoe UI", 7),
+                     bd=0, padx=0, pady=0).pack(anchor="w")
 
     def _reset_body(self) -> None:
         """Clear body and re-add the settings panel if we're in manage mode."""
