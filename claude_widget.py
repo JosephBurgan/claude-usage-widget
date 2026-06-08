@@ -132,12 +132,16 @@ def is_auth_error(exc: BaseException) -> bool:
 
 
 def retry_after_seconds(exc: BaseException) -> int | None:
-    """If exc is a 429 with a Retry-After header, return that delay in seconds."""
+    """If exc is a 429, return how many seconds to wait before retrying.
+
+    Honors the Retry-After header when it's a positive integer; falls back
+    otherwise (some servers send an invalid `Retry-After: 0`).
+    """
     if not (isinstance(exc, HTTPError) and exc.response is not None
             and exc.response.status_code == 429):
         return None
     raw = exc.response.headers.get("Retry-After", "").strip()
-    if raw.isdigit():
+    if raw.isdigit() and int(raw) > 0:
         return int(raw)
     return RATE_LIMIT_FALLBACK_S
 
