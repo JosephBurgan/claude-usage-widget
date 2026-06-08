@@ -208,13 +208,13 @@ BAR_HIGH     = "#f44336"
 ACCENT       = "#7c7c7c"
 ACCENT_OFF   = "#444444"
 SEPARATOR    = "#333333"
-BTN_BG       = "#2d5fa3"
-BTN_BG_HOVER = "#3a72c0"
+BTN_BG       = "#2a2a2a"
+BTN_BG_HOVER = "#3a3a3a"
 WIDTH        = 220
 
-REFRESH_MIN_S     = 5
-REFRESH_MAX_S     = 600
-REFRESH_DEFAULT_S = 60
+# Discrete refresh-timer presets, in minutes.
+MINUTE_PRESETS      = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 45, 60]
+REFRESH_DEFAULT_MIN = 1
 RATE_LIMIT_FALLBACK_S = 120  # Used when 429 response omits Retry-After.
 
 
@@ -238,8 +238,7 @@ class UsageWidget(tk.Tk):
         self._drag_y      = 0
         self._settings    = load_settings()
         self._hidden: set[str] = set(self._settings.get("hidden", []))
-        self._refresh_s   = self._clamp_refresh(
-            self._settings.get("refresh_seconds", REFRESH_DEFAULT_S))
+        self._refresh_min = self._init_refresh_minutes()
         self._manage_mode = False
         self._last_rows: list[tuple[str, float, str]] = []
         self._destroyed   = False
@@ -282,6 +281,8 @@ class UsageWidget(tk.Tk):
         self._body.pack(fill="x", padx=8, pady=(0, 4))
         tk.Label(self._body, text="Loading…", bg=BG, fg=FG_DIM,
                  font=("Segoe UI", 8)).pack(anchor="w")
+
+        self._make_refresh_button(self).pack(fill="x", padx=8, pady=(4, 2))
 
         self._ts_lbl = tk.Label(self, bg=BG, fg=FG_DIM, font=("Segoe UI", 7))
         self._ts_lbl.pack(anchor="e", padx=8, pady=(0, 4))
@@ -349,7 +350,7 @@ class UsageWidget(tk.Tk):
         threading.Thread(target=self._fetch, daemon=True).start()
 
     def _fetch(self) -> None:
-        next_delay_s = self._refresh_s
+        next_delay_s = self._refresh_min * 60
         try:
             data = fetch_usage()
             rows = parse_usage(data)
@@ -410,30 +411,32 @@ class UsageWidget(tk.Tk):
         panel = tk.Frame(self._body, bg=BG)
         panel.pack(fill="x", pady=(0, 4))
 
-        refresh_btn = tk.Label(
-            panel, text="↻  Refresh now",
-            bg=BTN_BG, fg="white", font=("Segoe UI", 8, "bold"),
-            cursor="hand2", pady=3)
-        refresh_btn.pack(fill="x", pady=(0, 6))
-        refresh_btn.bind("<Button-1>", lambda _e: self._manual_refresh())
-        refresh_btn.bind("<Enter>",   lambda _e: refresh_btn.config(bg=BTN_BG_HOVER))
-        refresh_btn.bind("<Leave>",   lambda _e: refresh_btn.config(bg=BTN_BG))
+        self._make_refresh_button(panel).pack(fill="x", pady=(0, 6))
 
         self._refresh_lbl = tk.Label(
-            panel, text=self._fmt_refresh_label(self._refresh_s),
+            panel, text=self._fmt_refresh_label(self._refresh_min),
             bg=BG, fg=FG, font=("Segoe UI", 8))
         self._refresh_lbl.pack(anchor="w")
 
         scale = tk.Scale(
-            panel, from_=REFRESH_MIN_S, to=REFRESH_MAX_S, resolution=5,
+            panel, from_=0, to=len(MINUTE_PRESETS) - 1, resolution=1,
             orient="horizontal", showvalue=False,
             bg=BG, fg=FG, troughcolor=BAR_BG, highlightthickness=0,
             activebackground=ACCENT, sliderrelief="flat", borderwidth=0,
-            command=lambda v: self._set_refresh(int(float(v))))
-        scale.set(self._refresh_s)
+            command=lambda v: self._set_refresh_index(int(float(v))))
+        scale.set(MINUTE_PRESETS.index(self._refresh_min))
         scale.pack(fill="x")
 
         tk.Frame(self._body, bg=SEPARATOR, height=1).pack(fill="x", pady=(0, 4))
+
+    def _make_refresh_button(self, parent: tk.Misc) -> tk.Label:
+        btn = tk.Label(parent, text="↻  Refresh",
+                       bg=BTN_BG, fg=FG, font=("Segoe UI", 8),
+                       cursor="hand2", pady=3)
+        btn.bind("<Button-1>", lambda _e: self._manual_refresh())
+        btn.bind("<Enter>",   lambda _e: btn.config(bg=BTN_BG_HOVER))
+        btn.bind("<Leave>",   lambda _e: btn.config(bg=BTN_BG))
+        return btn
 
     def _toggle_manage(self) -> None:
         self._manage_mode = not self._manage_mode
@@ -448,30 +451,49 @@ class UsageWidget(tk.Tk):
         if self._last_rows:
             self._render(self._last_rows)
 
+    def _init_refresh_minutes(self) -> int:
+        """Load refresh interval (minutes), migrating legacy seconds key if present."""
+        raw = self._settings.get("refresh_minutes")
+        if raw is None and "refresh_seconds" in self._settings:
+            try:
+                raw = max(1, round(int(self._settings["refresh_seconds"]) / 60))
+            except (TypeError, ValueError):
+                raw = REFRESH_DEFAULT_MIN
+            del self._settings["refresh_seconds"]
+        minutes = self._snap_to_preset(raw if raw is not None else REFRESH_DEFAULT_MIN)
+        if self._settings.get("refresh_minutes") != minutes:
+            self._settings["refresh_minutes"] = minutes
+            save_settings(self._settings)
+        return minutes
+
     @staticmethod
-    def _clamp_refresh(value: object) -> int:
+    def _snap_to_preset(value: object) -> int:
+        """Round any number to the nearest MINUTE_PRESETS entry."""
         try:
             n = int(value)  # type: ignore[arg-type]
         except (TypeError, ValueError):
-            return REFRESH_DEFAULT_S
-        return max(REFRESH_MIN_S, min(REFRESH_MAX_S, n))
+            return REFRESH_DEFAULT_MIN
+        return min(MINUTE_PRESETS, key=lambda m: abs(m - n))
 
-    def _set_refresh(self, seconds: int) -> None:
-        seconds = self._clamp_refresh(seconds)
-        if seconds == self._refresh_s:
+    def _set_refresh_index(self, idx: int) -> None:
+        if not 0 <= idx < len(MINUTE_PRESETS):
             return
-        self._refresh_s = seconds
-        self._settings["refresh_seconds"] = seconds
+        minutes = MINUTE_PRESETS[idx]
+        if minutes == self._refresh_min:
+            return
+        self._refresh_min = minutes
+        self._settings["refresh_minutes"] = minutes
         save_settings(self._settings)
         if hasattr(self, "_refresh_lbl"):
-            self._refresh_lbl.config(text=self._fmt_refresh_label(seconds))
+            self._refresh_lbl.config(text=self._fmt_refresh_label(minutes))
 
     @staticmethod
-    def _fmt_refresh_label(seconds: int) -> str:
-        if seconds < 60:
-            return f"Refresh timer: {seconds}s"
-        m, s = divmod(seconds, 60)
-        return f"Refresh timer: {m}m" if s == 0 else f"Refresh timer: {m}m {s}s"
+    def _fmt_refresh_label(minutes: int) -> str:
+        if minutes >= 60:
+            hours = minutes // 60
+            return f"Refresh timer: {hours} hr" if hours == 1 else f"Refresh timer: {hours} hrs"
+        unit = "min" if minutes == 1 else "min"
+        return f"Refresh timer: {minutes} {unit}"
 
     def _add_row(self, label: str, util: float, sub: str) -> None:
         pct        = min(int(util * 100), 100)
