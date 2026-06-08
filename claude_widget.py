@@ -208,6 +208,8 @@ BAR_HIGH     = "#f44336"
 ACCENT       = "#7c7c7c"
 ACCENT_OFF   = "#444444"
 SEPARATOR    = "#333333"
+BTN_BG       = "#2d5fa3"
+BTN_BG_HOVER = "#3a72c0"
 WIDTH        = 220
 
 REFRESH_MIN_S     = 5
@@ -241,6 +243,8 @@ class UsageWidget(tk.Tk):
         self._manage_mode = False
         self._last_rows: list[tuple[str, float, str]] = []
         self._destroyed   = False
+        self._fetch_in_flight = False
+        self._next_after_id: str | None = None
 
         self._build_ui()
         self.update_idletasks()
@@ -303,14 +307,20 @@ class UsageWidget(tk.Tk):
         self._destroyed = True
         self.destroy()
 
-    def _after_safe(self, *args, **kwargs) -> None:
-        """`self.after` that silently no-ops if the window has been destroyed."""
+    def _after_safe(self, *args, remember_id: bool = False, **kwargs) -> None:
+        """`self.after` that silently no-ops if the window has been destroyed.
+
+        If remember_id=True, stores the returned after-id so it can be cancelled
+        (used for the next-poll timer so a manual refresh can supersede it).
+        """
         if self._destroyed:
             return
         try:
-            self.after(*args, **kwargs)
+            aid = self.after(*args, **kwargs)
         except tk.TclError:
-            pass
+            return
+        if remember_id:
+            self._next_after_id = aid
 
     # ── drag ──────────────────────────────────────────────────────────────────
 
@@ -331,8 +341,11 @@ class UsageWidget(tk.Tk):
     # ── refresh loop ──────────────────────────────────────────────────────────
 
     def _schedule_refresh(self) -> None:
-        if self._destroyed:
+        """Kick off a fetch in a worker thread, dropping any pending timer."""
+        if self._destroyed or self._fetch_in_flight:
             return
+        self._next_after_id = None
+        self._fetch_in_flight = True
         threading.Thread(target=self._fetch, daemon=True).start()
 
     def _fetch(self) -> None:
@@ -340,7 +353,7 @@ class UsageWidget(tk.Tk):
         try:
             data = fetch_usage()
             rows = parse_usage(data)
-            self._after_safe(0, self._render, rows)
+            self._after_safe(0, self._on_fetch_success, rows)
         except Exception as exc:  # noqa: BLE001 — top-level handler for polling loop
             if is_auth_error(exc):
                 self._after_safe(0, self._show_login)
@@ -349,7 +362,26 @@ class UsageWidget(tk.Tk):
             backoff = retry_after_seconds(exc)
             if backoff is not None:
                 next_delay_s = max(next_delay_s, backoff)
-        self._after_safe(next_delay_s * 1000, self._schedule_refresh)
+        finally:
+            self._fetch_in_flight = False
+        self._after_safe(next_delay_s * 1000, self._schedule_refresh,
+                         remember_id=True)
+
+    def _on_fetch_success(self, rows: list[tuple[str, float, str]]) -> None:
+        self._render(rows)
+        self._ts_lbl.config(text=time.strftime("Updated %H:%M:%S"))
+
+    def _manual_refresh(self) -> None:
+        """User-initiated refresh from the settings panel; debounced via in-flight flag."""
+        if self._fetch_in_flight:
+            return
+        if self._next_after_id is not None:
+            try:
+                self.after_cancel(self._next_after_id)
+            except tk.TclError:
+                pass
+            self._next_after_id = None
+        self._schedule_refresh()
 
     # ── render ────────────────────────────────────────────────────────────────
 
@@ -372,12 +404,20 @@ class UsageWidget(tk.Tk):
             for row in visible:
                 self._add_row(*row)
 
-        self._ts_lbl.config(text=time.strftime("Updated %H:%M:%S"))
         self.update_idletasks()
 
     def _add_settings_panel(self) -> None:
         panel = tk.Frame(self._body, bg=BG)
         panel.pack(fill="x", pady=(0, 4))
+
+        refresh_btn = tk.Label(
+            panel, text="↻  Refresh now",
+            bg=BTN_BG, fg="white", font=("Segoe UI", 8, "bold"),
+            cursor="hand2", pady=3)
+        refresh_btn.pack(fill="x", pady=(0, 6))
+        refresh_btn.bind("<Button-1>", lambda _e: self._manual_refresh())
+        refresh_btn.bind("<Enter>",   lambda _e: refresh_btn.config(bg=BTN_BG_HOVER))
+        refresh_btn.bind("<Leave>",   lambda _e: refresh_btn.config(bg=BTN_BG))
 
         self._refresh_lbl = tk.Label(
             panel, text=self._fmt_refresh_label(self._refresh_s),
@@ -429,9 +469,9 @@ class UsageWidget(tk.Tk):
     @staticmethod
     def _fmt_refresh_label(seconds: int) -> str:
         if seconds < 60:
-            return f"Refresh: {seconds}s"
+            return f"Refresh timer: {seconds}s"
         m, s = divmod(seconds, 60)
-        return f"Refresh: {m}m" if s == 0 else f"Refresh: {m}m {s}s"
+        return f"Refresh timer: {m}m" if s == 0 else f"Refresh timer: {m}m {s}s"
 
     def _add_row(self, label: str, util: float, sub: str) -> None:
         pct        = min(int(util * 100), 100)
