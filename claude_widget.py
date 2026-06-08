@@ -131,6 +131,17 @@ def is_auth_error(exc: BaseException) -> bool:
     return False
 
 
+def retry_after_seconds(exc: BaseException) -> int | None:
+    """If exc is a 429 with a Retry-After header, return that delay in seconds."""
+    if not (isinstance(exc, HTTPError) and exc.response is not None
+            and exc.response.status_code == 429):
+        return None
+    raw = exc.response.headers.get("Retry-After", "").strip()
+    if raw.isdigit():
+        return int(raw)
+    return RATE_LIMIT_FALLBACK_S
+
+
 # ── Display helpers ───────────────────────────────────────────────────────────
 
 TIER_LABELS = {
@@ -194,7 +205,11 @@ ACCENT       = "#7c7c7c"
 ACCENT_OFF   = "#444444"
 SEPARATOR    = "#333333"
 WIDTH        = 220
-REFRESH_MS   = 30_000
+
+REFRESH_MIN_S     = 5
+REFRESH_MAX_S     = 600
+REFRESH_DEFAULT_S = 30
+RATE_LIMIT_FALLBACK_S = 120  # Used when 429 response omits Retry-After.
 
 
 def bar_color(util: float) -> str:
@@ -217,6 +232,8 @@ class UsageWidget(tk.Tk):
         self._drag_y      = 0
         self._settings    = load_settings()
         self._hidden: set[str] = set(self._settings.get("hidden", []))
+        self._refresh_s   = self._clamp_refresh(
+            self._settings.get("refresh_seconds", REFRESH_DEFAULT_S))
         self._manage_mode = False
         self._last_rows: list[tuple[str, float, str]] = []
         self._destroyed   = False
@@ -315,6 +332,7 @@ class UsageWidget(tk.Tk):
         threading.Thread(target=self._fetch, daemon=True).start()
 
     def _fetch(self) -> None:
+        next_delay_s = self._refresh_s
         try:
             data = fetch_usage()
             rows = parse_usage(data)
@@ -324,7 +342,10 @@ class UsageWidget(tk.Tk):
                 self._after_safe(0, self._show_login)
             else:
                 self._after_safe(0, self._show_error, str(exc))
-        self._after_safe(REFRESH_MS, self._schedule_refresh)
+            backoff = retry_after_seconds(exc)
+            if backoff is not None:
+                next_delay_s = max(next_delay_s, backoff)
+        self._after_safe(next_delay_s * 1000, self._schedule_refresh)
 
     # ── render ────────────────────────────────────────────────────────────────
 
@@ -334,6 +355,7 @@ class UsageWidget(tk.Tk):
             w.destroy()
 
         if self._manage_mode:
+            self._add_settings_panel()
             visible = rows
         else:
             visible = [r for r in rows if r[0] not in self._hidden]
@@ -349,6 +371,26 @@ class UsageWidget(tk.Tk):
         self._ts_lbl.config(text=time.strftime("Updated %H:%M:%S"))
         self.update_idletasks()
 
+    def _add_settings_panel(self) -> None:
+        panel = tk.Frame(self._body, bg=BG)
+        panel.pack(fill="x", pady=(0, 4))
+
+        self._refresh_lbl = tk.Label(
+            panel, text=self._fmt_refresh_label(self._refresh_s),
+            bg=BG, fg=FG, font=("Segoe UI", 8))
+        self._refresh_lbl.pack(anchor="w")
+
+        scale = tk.Scale(
+            panel, from_=REFRESH_MIN_S, to=REFRESH_MAX_S, resolution=5,
+            orient="horizontal", showvalue=False,
+            bg=BG, fg=FG, troughcolor=BAR_BG, highlightthickness=0,
+            activebackground=ACCENT, sliderrelief="flat", borderwidth=0,
+            command=lambda v: self._set_refresh(int(float(v))))
+        scale.set(self._refresh_s)
+        scale.pack(fill="x")
+
+        tk.Frame(self._body, bg=SEPARATOR, height=1).pack(fill="x", pady=(0, 4))
+
     def _toggle_manage(self) -> None:
         self._manage_mode = not self._manage_mode
         self._gear_btn.config(fg="white" if self._manage_mode else ACCENT)
@@ -361,6 +403,31 @@ class UsageWidget(tk.Tk):
         save_settings(self._settings)
         if self._last_rows:
             self._render(self._last_rows)
+
+    @staticmethod
+    def _clamp_refresh(value: object) -> int:
+        try:
+            n = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return REFRESH_DEFAULT_S
+        return max(REFRESH_MIN_S, min(REFRESH_MAX_S, n))
+
+    def _set_refresh(self, seconds: int) -> None:
+        seconds = self._clamp_refresh(seconds)
+        if seconds == self._refresh_s:
+            return
+        self._refresh_s = seconds
+        self._settings["refresh_seconds"] = seconds
+        save_settings(self._settings)
+        if hasattr(self, "_refresh_lbl"):
+            self._refresh_lbl.config(text=self._fmt_refresh_label(seconds))
+
+    @staticmethod
+    def _fmt_refresh_label(seconds: int) -> str:
+        if seconds < 60:
+            return f"Refresh: {seconds}s"
+        m, s = divmod(seconds, 60)
+        return f"Refresh: {m}m" if s == 0 else f"Refresh: {m}m {s}s"
 
     def _add_row(self, label: str, util: float, sub: str) -> None:
         pct        = min(int(util * 100), 100)
