@@ -1,63 +1,96 @@
+"""Claude Usage Widget — floating always-on-top window showing Claude.ai plan usage.
+
+Reads OAuth tokens from ~/.claude/.credentials.json (created by the Claude Code
+CLI), polls https://api.anthropic.com/api/oauth/usage every 30 seconds, and
+auto-refreshes the access token when it's near expiry.
 """
-Claude Usage Widget — minimal always-on-top floating window.
-Reads ~/.claude/.credentials.json, refreshes OAuth token as needed,
-calls api.anthropic.com/api/oauth/usage every 30 seconds.
-"""
+
+from __future__ import annotations
 
 import json
 import os
+import tempfile
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 
 import requests
+from requests.exceptions import HTTPError
 
-# ── Credentials ──────────────────────────────────────────────────────────────
+# ── Paths ────────────────────────────────────────────────────────────────────
 
-CREDS_FILE    = os.path.join(os.environ["USERPROFILE"], ".claude", ".credentials.json")
-SETTINGS_FILE = os.path.join(os.environ["USERPROFILE"], ".claude_widget_settings.json")
+HOME          = Path.home()
+CREDS_FILE    = HOME / ".claude" / ".credentials.json"
+SETTINGS_FILE = HOME / ".claude_widget_settings.json"
 
+
+# ── Atomic JSON I/O ──────────────────────────────────────────────────────────
+
+def _read_json(path: Path) -> dict:
+    with path.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    """Write JSON via temp-file + os.replace so a crash mid-write can't corrupt the file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        # Best-effort cleanup; original file is untouched.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ── Settings ─────────────────────────────────────────────────────────────────
 
 def load_settings() -> dict:
     try:
-        with open(SETTINGS_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
+        return _read_json(SETTINGS_FILE)
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
-def save_settings(s: dict):
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(s, f, indent=2)
+def save_settings(s: dict) -> None:
+    _write_json_atomic(SETTINGS_FILE, s)
 
+
+# ── OAuth / API ──────────────────────────────────────────────────────────────
 
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 API_HDRS  = {"anthropic-version": "2023-06-01", "anthropic-beta": "oauth-2025-04-20"}
 
+# Refresh the access token when it's within this many ms of expiry.
+TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000
+
 
 def _load_creds() -> dict:
-    with open(CREDS_FILE, encoding="utf-8") as f:
-        return json.load(f)["claudeAiOauth"]
+    return _read_json(CREDS_FILE)["claudeAiOauth"]
 
 
-def _save_creds(oauth: dict):
-    with open(CREDS_FILE, encoding="utf-8") as f:
-        root = json.load(f)
-    root["claudeAiOauth"].update(oauth)
-    with open(CREDS_FILE, "w", encoding="utf-8") as f:
-        json.dump(root, f, indent=2)
+def _save_creds_update(oauth_patch: dict) -> None:
+    root = _read_json(CREDS_FILE)
+    root["claudeAiOauth"].update(oauth_patch)
+    _write_json_atomic(CREDS_FILE, root)
 
 
 def get_fresh_token() -> str:
-    """Return a valid access token, refreshing if expired."""
+    """Return a valid access token, refreshing it if it's near expiry."""
     creds = _load_creds()
-    # Consider expired if within 5 minutes of expiry (ms timestamp)
-    if creds["expiresAt"] - time.time() * 1000 > 300_000:
+    if creds["expiresAt"] - time.time() * 1000 > TOKEN_REFRESH_MARGIN_MS:
         return creds["accessToken"]
 
-    r = requests.post(TOKEN_URL,
+    r = requests.post(
+        TOKEN_URL,
         json={
             "grant_type":    "refresh_token",
             "client_id":     CLIENT_ID,
@@ -65,28 +98,37 @@ def get_fresh_token() -> str:
             "scope":         " ".join(creds.get("scopes", [])),
         },
         headers={"Content-Type": "application/json", **API_HDRS},
-        timeout=10)
+        timeout=10,
+    )
     r.raise_for_status()
     data = r.json()
 
-    new_expiry = int(time.time() * 1000) + data["expires_in"] * 1000
-    _save_creds({
+    _save_creds_update({
         "accessToken":  data["access_token"],
         "refreshToken": data.get("refresh_token", creds["refreshToken"]),
-        "expiresAt":    new_expiry,
+        "expiresAt":    int(time.time() * 1000) + data["expires_in"] * 1000,
     })
     return data["access_token"]
 
 
-# ── API ───────────────────────────────────────────────────────────────────────
-
 def fetch_usage() -> dict:
     token = get_fresh_token()
-    r = requests.get(USAGE_URL,
+    r = requests.get(
+        USAGE_URL,
         headers={"Authorization": f"Bearer {token}", **API_HDRS},
-        timeout=10)
+        timeout=10,
+    )
     r.raise_for_status()
     return r.json()
+
+
+def is_auth_error(exc: BaseException) -> bool:
+    """True if the exception represents an auth/credentials problem (vs network/server)."""
+    if isinstance(exc, FileNotFoundError):
+        return True
+    if isinstance(exc, HTTPError) and exc.response is not None:
+        return exc.response.status_code in (400, 401, 403)
+    return False
 
 
 # ── Display helpers ───────────────────────────────────────────────────────────
@@ -107,32 +149,32 @@ def _fmt_countdown(resets_at_iso: str) -> str:
     try:
         dt   = datetime.fromisoformat(resets_at_iso.replace("Z", "+00:00"))
         diff = int((dt - datetime.now(timezone.utc)).total_seconds())
-        if diff <= 0:
-            return "resetting…"
-        h, rem = divmod(diff, 3600)
-        m = rem // 60
-        return f"resets in {h}h {m}m" if h else f"resets in {m}m"
-    except Exception:
+    except ValueError:
         return ""
+    if diff <= 0:
+        return "resetting…"
+    h, rem = divmod(diff, 3600)
+    m = rem // 60
+    return f"resets in {h}h {m}m" if h else f"resets in {m}m"
 
 
 def parse_usage(data: dict) -> list[tuple[str, float, str]]:
-    rows = []
+    """Convert the API response into [(label, utilization 0..1, sublabel), ...]."""
+    rows: list[tuple[str, float, str]] = []
+
     for key, label in TIER_LABELS.items():
         tier = data.get(key)
-        if not tier:
+        if not tier or tier.get("utilization") is None:
             continue
-        util = tier.get("utilization")
-        if util is None:
-            continue
-        resets_at = tier.get("resets_at") or ""
-        rows.append((label, float(util) / 100.0, _fmt_countdown(resets_at)))
+        util      = float(tier["utilization"]) / 100.0
+        countdown = _fmt_countdown(tier.get("resets_at") or "")
+        rows.append((label, util, countdown))
 
     extra = data.get("extra_usage")
     if extra and extra.get("is_enabled"):
-        used  = extra.get("used_credits") or 0
-        limit = extra.get("monthly_limit") or 1
-        util  = used / limit if limit else 0
+        used  = float(extra.get("used_credits") or 0)
+        limit = float(extra.get("monthly_limit") or 0)
+        util  = used / limit if limit > 0 else 0.0
         cur   = extra.get("currency", "USD")
         rows.append(("Extra credits", util, f"{cur} {used:.2f} / {limit:.2f}"))
 
@@ -141,16 +183,18 @@ def parse_usage(data: dict) -> list[tuple[str, float, str]]:
 
 # ── Widget ────────────────────────────────────────────────────────────────────
 
-BG         = "#1a1a1a"
-FG         = "#e0e0e0"
-FG_DIM     = "#888888"
-BAR_BG     = "#333333"
-BAR_LOW    = "#4caf50"
-BAR_MED    = "#ff9800"
-BAR_HIGH   = "#f44336"
-ACCENT     = "#7c7c7c"
-WIDTH      = 220
-REFRESH_MS = 30_000
+BG           = "#1a1a1a"
+FG           = "#e0e0e0"
+FG_DIM       = "#888888"
+BAR_BG       = "#333333"
+BAR_LOW      = "#4caf50"
+BAR_MED      = "#ff9800"
+BAR_HIGH     = "#f44336"
+ACCENT       = "#7c7c7c"
+ACCENT_OFF   = "#444444"
+SEPARATOR    = "#333333"
+WIDTH        = 220
+REFRESH_MS   = 30_000
 
 
 def bar_color(util: float) -> str:
@@ -160,7 +204,7 @@ def bar_color(util: float) -> str:
 
 
 class UsageWidget(tk.Tk):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.overrideredirect(True)
         self.attributes("-topmost", True)
@@ -172,46 +216,42 @@ class UsageWidget(tk.Tk):
         self._drag_x      = 0
         self._drag_y      = 0
         self._settings    = load_settings()
-        self._hidden      = set(self._settings.get("hidden", []))
+        self._hidden: set[str] = set(self._settings.get("hidden", []))
         self._manage_mode = False
-        self._last_rows: list = []
+        self._last_rows: list[tuple[str, float, str]] = []
+        self._destroyed   = False
 
         self._build_ui()
         self.update_idletasks()
         self._place_bottom_right()
         self.lift()
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._schedule_refresh()
 
     # ── layout ────────────────────────────────────────────────────────────────
 
-    def _build_ui(self):
+    def _build_ui(self) -> None:
         hdr = tk.Frame(self, bg=BG, cursor="fleur")
         hdr.pack(fill="x", padx=6, pady=(6, 2))
-        hdr.bind("<ButtonPress-1>", self._drag_start)
-        hdr.bind("<B1-Motion>",     self._drag_move)
+        self._bind_drag(hdr)
 
         title = tk.Label(hdr, text="Claude Usage", bg=BG, fg=FG,
                          font=("Segoe UI", 9, "bold"), cursor="fleur")
         title.pack(side="left")
-        title.bind("<ButtonPress-1>", self._drag_start)
-        title.bind("<B1-Motion>",     self._drag_move)
+        self._bind_drag(title)
 
-        self._pin_btn = tk.Label(hdr, text="📌", bg=BG, fg=ACCENT,
-                                 font=("Segoe UI", 9), cursor="hand2")
-        self._pin_btn.pack(side="right", padx=(0, 2))
-        self._pin_btn.bind("<Button-1>", self._toggle_topmost)
-
-        self._gear_btn = tk.Label(hdr, text="⚙", bg=BG, fg=ACCENT,
-                                  font=("Segoe UI", 10), cursor="hand2")
-        self._gear_btn.pack(side="right", padx=(0, 4))
-        self._gear_btn.bind("<Button-1>", self._toggle_manage)
-
-        close = tk.Label(hdr, text="✕", bg=BG, fg=ACCENT,
-                         font=("Segoe UI", 9), cursor="hand2")
+        # Header buttons (right-to-left order in the layout)
+        close = self._make_icon_btn(hdr, "✕", self._on_close)
         close.pack(side="right", padx=(0, 4))
-        close.bind("<Button-1>", lambda _: self.destroy())
 
-        tk.Frame(self, bg="#333333", height=1).pack(fill="x", padx=6, pady=(0, 4))
+        self._gear_btn = self._make_icon_btn(hdr, "⚙", self._toggle_manage, size=10)
+        self._gear_btn.pack(side="right", padx=(0, 4))
+
+        self._pin_btn = self._make_icon_btn(hdr, "📌", self._toggle_topmost)
+        self._pin_btn.pack(side="right", padx=(0, 2))
+
+        tk.Frame(self, bg=SEPARATOR, height=1).pack(fill="x", padx=6, pady=(0, 4))
 
         self._body = tk.Frame(self, bg=BG)
         self._body.pack(fill="x", padx=8, pady=(0, 4))
@@ -221,87 +261,112 @@ class UsageWidget(tk.Tk):
         self._ts_lbl = tk.Label(self, bg=BG, fg=FG_DIM, font=("Segoe UI", 7))
         self._ts_lbl.pack(anchor="e", padx=8, pady=(0, 4))
 
-    def _place_bottom_right(self):
+    def _make_icon_btn(self, parent: tk.Misc, text: str, cb, size: int = 9) -> tk.Label:
+        lbl = tk.Label(parent, text=text, bg=BG, fg=ACCENT,
+                       font=("Segoe UI", size), cursor="hand2")
+        lbl.bind("<Button-1>", lambda _e: cb())
+        return lbl
+
+    def _bind_drag(self, widget: tk.Misc) -> None:
+        widget.bind("<ButtonPress-1>", self._drag_start)
+        widget.bind("<B1-Motion>",     self._drag_move)
+
+    def _place_bottom_right(self) -> None:
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
         self.geometry(f"+{sw - WIDTH - 20}+{sh - 220}")
 
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+
+    def _on_close(self) -> None:
+        self._destroyed = True
+        self.destroy()
+
+    def _after_safe(self, *args, **kwargs) -> None:
+        """`self.after` that silently no-ops if the window has been destroyed."""
+        if self._destroyed:
+            return
+        try:
+            self.after(*args, **kwargs)
+        except tk.TclError:
+            pass
+
     # ── drag ──────────────────────────────────────────────────────────────────
 
-    def _drag_start(self, e):
+    def _drag_start(self, e: tk.Event) -> None:
         self._drag_x = e.x_root - self.winfo_x()
         self._drag_y = e.y_root - self.winfo_y()
 
-    def _drag_move(self, e):
+    def _drag_move(self, e: tk.Event) -> None:
         self.geometry(f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
 
     # ── pin ───────────────────────────────────────────────────────────────────
 
-    def _toggle_topmost(self, _=None):
+    def _toggle_topmost(self) -> None:
         self._on_top = not self._on_top
         self.attributes("-topmost", self._on_top)
-        self._pin_btn.config(fg=ACCENT if self._on_top else "#444444")
+        self._pin_btn.config(fg=ACCENT if self._on_top else ACCENT_OFF)
 
-    # ── refresh ───────────────────────────────────────────────────────────────
+    # ── refresh loop ──────────────────────────────────────────────────────────
 
-    def _schedule_refresh(self):
+    def _schedule_refresh(self) -> None:
+        if self._destroyed:
+            return
         threading.Thread(target=self._fetch, daemon=True).start()
 
-    def _fetch(self):
+    def _fetch(self) -> None:
         try:
             data = fetch_usage()
             rows = parse_usage(data)
-            self.after(0, self._render, rows)
-        except FileNotFoundError:
-            self.after(0, self._show_login)
-        except Exception as exc:
-            msg = str(exc)
-            if "invalid_grant" in msg or "401" in msg or "400" in msg:
-                self.after(0, self._show_login)
+            self._after_safe(0, self._render, rows)
+        except Exception as exc:  # noqa: BLE001 — top-level handler for polling loop
+            if is_auth_error(exc):
+                self._after_safe(0, self._show_login)
             else:
-                self.after(0, self._show_error, msg)
-        self.after(REFRESH_MS, self._schedule_refresh)
+                self._after_safe(0, self._show_error, str(exc))
+        self._after_safe(REFRESH_MS, self._schedule_refresh)
 
     # ── render ────────────────────────────────────────────────────────────────
 
-    def _render(self, rows: list):
+    def _render(self, rows: list[tuple[str, float, str]]) -> None:
         self._last_rows = rows
         for w in self._body.winfo_children():
             w.destroy()
 
-        visible = rows if self._manage_mode else [r for r in rows if r[0] not in self._hidden]
+        if self._manage_mode:
+            visible = rows
+        else:
+            visible = [r for r in rows if r[0] not in self._hidden]
 
         if not visible and not self._manage_mode:
             tk.Label(self._body, text="All rows hidden — click ⚙ to show some",
                      bg=BG, fg=FG_DIM, font=("Segoe UI", 8),
                      wraplength=WIDTH - 20).pack(anchor="w")
         else:
-            for label, util, sub in visible:
-                self._add_row(label, util, sub)
+            for row in visible:
+                self._add_row(*row)
 
         self._ts_lbl.config(text=time.strftime("Updated %H:%M:%S"))
         self.update_idletasks()
 
-    def _toggle_manage(self, _=None):
+    def _toggle_manage(self) -> None:
         self._manage_mode = not self._manage_mode
         self._gear_btn.config(fg="white" if self._manage_mode else ACCENT)
         if self._last_rows:
             self._render(self._last_rows)
 
-    def _toggle_hidden(self, label: str):
-        if label in self._hidden:
-            self._hidden.remove(label)
-        else:
-            self._hidden.add(label)
+    def _toggle_hidden(self, label: str) -> None:
+        self._hidden ^= {label}
         self._settings["hidden"] = sorted(self._hidden)
         save_settings(self._settings)
         if self._last_rows:
             self._render(self._last_rows)
 
-    def _add_row(self, label: str, util: float, sub: str):
-        pct    = min(int(util * 100), 100)
-        color  = bar_color(util)
-        hidden = label in self._hidden
+    def _add_row(self, label: str, util: float, sub: str) -> None:
+        pct        = min(int(util * 100), 100)
+        hidden     = label in self._hidden
+        active_fg  = FG_DIM if hidden else FG
+        active_bar = FG_DIM if hidden else bar_color(util)
 
         row = tk.Frame(self._body, bg=BG)
         row.pack(fill="x", pady=(4, 0))
@@ -310,31 +375,27 @@ class UsageWidget(tk.Tk):
         top.pack(fill="x")
 
         if self._manage_mode:
-            box_char = "☑" if not hidden else "☐"
-            box = tk.Label(top, text=box_char, bg=BG,
-                           fg=FG if not hidden else FG_DIM,
+            box = tk.Label(top, text="☐" if hidden else "☑", bg=BG, fg=active_fg,
                            font=("Segoe UI", 9), cursor="hand2")
             box.pack(side="left", padx=(0, 4))
             box.bind("<Button-1>", lambda _e, l=label: self._toggle_hidden(l))
 
-        text_color = FG if not hidden else FG_DIM
-        tk.Label(top, text=label, bg=BG, fg=text_color,
+        tk.Label(top, text=label, bg=BG, fg=active_fg,
                  font=("Segoe UI", 8)).pack(side="left")
-        tk.Label(top, text=f"{pct}%", bg=BG,
-                 fg=color if not hidden else FG_DIM,
+        tk.Label(top, text=f"{pct}%", bg=BG, fg=active_bar,
                  font=("Segoe UI", 8, "bold")).pack(side="right")
 
         bar_frame = tk.Frame(row, bg=BAR_BG, height=5)
         bar_frame.pack(fill="x", pady=(2, 0))
         bar_frame.pack_propagate(False)
-        tk.Frame(bar_frame, bg=color if not hidden else FG_DIM, height=5).place(
-            relx=0, rely=0, relwidth=min(util, 1.0), relheight=1.0)
+        tk.Frame(bar_frame, bg=active_bar, height=5).place(
+            relx=0, rely=0, relwidth=min(max(util, 0.0), 1.0), relheight=1.0)
 
         if sub:
             tk.Label(row, text=sub, bg=BG, fg=FG_DIM,
                      font=("Segoe UI", 7)).pack(anchor="w")
 
-    def _show_login(self):
+    def _show_login(self) -> None:
         for w in self._body.winfo_children():
             w.destroy()
         tk.Label(self._body, text="Not logged in", bg=BG, fg=FG_DIM,
@@ -344,7 +405,7 @@ class UsageWidget(tk.Tk):
                  wraplength=WIDTH - 20).pack(anchor="w", pady=(4, 0))
         self._ts_lbl.config(text="")
 
-    def _show_error(self, msg: str):
+    def _show_error(self, msg: str) -> None:
         for w in self._body.winfo_children():
             w.destroy()
         tk.Label(self._body, text=f"Error: {msg}", bg=BG, fg=BAR_HIGH,
@@ -353,6 +414,9 @@ class UsageWidget(tk.Tk):
         self._ts_lbl.config(text=time.strftime("Failed %H:%M:%S"))
 
 
+def main() -> None:
+    UsageWidget().mainloop()
+
+
 if __name__ == "__main__":
-    app = UsageWidget()
-    app.mainloop()
+    main()
