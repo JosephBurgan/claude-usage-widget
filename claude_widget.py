@@ -212,7 +212,7 @@ WIDTH        = 220
 
 REFRESH_MIN_S     = 5
 REFRESH_MAX_S     = 600
-REFRESH_DEFAULT_S = 30
+REFRESH_DEFAULT_S = 60
 RATE_LIMIT_FALLBACK_S = 120  # Used when 429 response omits Retry-After.
 
 
