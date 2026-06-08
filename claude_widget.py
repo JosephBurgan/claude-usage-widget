@@ -462,9 +462,15 @@ class UsageWidget(tk.Tk):
             tk.Label(row, text=sub, bg=BG, fg=FG_DIM,
                      font=("Segoe UI", 7)).pack(anchor="w")
 
-    def _show_login(self) -> None:
+    def _reset_body(self) -> None:
+        """Clear body and re-add the settings panel if we're in manage mode."""
         for w in self._body.winfo_children():
             w.destroy()
+        if self._manage_mode:
+            self._add_settings_panel()
+
+    def _show_login(self) -> None:
+        self._reset_body()
         tk.Label(self._body, text="Not logged in", bg=BG, fg=FG_DIM,
                  font=("Segoe UI", 8)).pack(anchor="w")
         tk.Label(self._body, text="Run 'claude' in a terminal\nto refresh credentials.",
@@ -473,8 +479,7 @@ class UsageWidget(tk.Tk):
         self._ts_lbl.config(text="")
 
     def _show_error(self, msg: str) -> None:
-        for w in self._body.winfo_children():
-            w.destroy()
+        self._reset_body()
         tk.Label(self._body, text=f"Error: {msg}", bg=BG, fg=BAR_HIGH,
                  font=("Segoe UI", 7), wraplength=WIDTH - 20,
                  justify="left").pack(anchor="w")
