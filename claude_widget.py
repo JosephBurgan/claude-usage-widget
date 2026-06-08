@@ -246,7 +246,7 @@ BTN_BG       = "#2a2a2a"
 BTN_BG_HOVER = "#3a3a3a"
 TIME_BAR_BG  = "#262626"   # slightly darker than BAR_BG
 TIME_BAR_FG  = "#999999"   # quiet light gray
-BAR_H        = 5
+BAR_H        = 6
 TIME_BAR_H   = 2            # slim accent under the usage bar
 WIDTH        = 220
 
@@ -307,7 +307,7 @@ class UsageWidget(tk.Tk):
         close = self._make_icon_btn(hdr, "✕", self._on_close)
         close.pack(side="right", padx=(0, 4))
 
-        self._gear_btn = self._make_icon_btn(hdr, "🔧", self._toggle_manage, size=9)
+        self._gear_btn = self._make_icon_btn(hdr, "☰", self._toggle_manage, size=11)
         self._gear_btn.pack(side="right", padx=(0, 4))
 
         self._pin_btn = self._make_icon_btn(hdr, "📌", self._toggle_topmost)
@@ -436,7 +436,7 @@ class UsageWidget(tk.Tk):
             visible = [r for r in rows if r[0] not in self._hidden]
 
         if not visible and not self._manage_mode:
-            tk.Label(self._body, text="All rows hidden — click 🔧 to show some",
+            tk.Label(self._body, text="All rows hidden — click ☰ to show some",
                      bg=BG, fg=FG_DIM, font=("Segoe UI", 8),
                      wraplength=WIDTH - 20).pack(anchor="w")
         else:
