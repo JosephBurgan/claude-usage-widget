@@ -307,7 +307,7 @@ class UsageWidget(tk.Tk):
         close = self._make_icon_btn(hdr, "✕", self._on_close)
         close.pack(side="right", padx=(0, 4))
 
-        self._gear_btn = self._make_icon_btn(hdr, "☰", self._toggle_manage, size=11)
+        self._gear_btn = self._make_icon_btn(hdr, "≡", self._toggle_manage, size=12)
         self._gear_btn.pack(side="right", padx=(0, 4))
 
         self._pin_btn = self._make_icon_btn(hdr, "📌", self._toggle_topmost)
@@ -436,7 +436,7 @@ class UsageWidget(tk.Tk):
             visible = [r for r in rows if r[0] not in self._hidden]
 
         if not visible and not self._manage_mode:
-            tk.Label(self._body, text="All rows hidden — click ☰ to show some",
+            tk.Label(self._body, text="All rows hidden — click ≡ to show some",
                      bg=BG, fg=FG_DIM, font=("Segoe UI", 8),
                      wraplength=WIDTH - 20).pack(anchor="w")
         else:
