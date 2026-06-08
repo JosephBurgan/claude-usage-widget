@@ -158,6 +158,35 @@ TIER_LABELS = {
     "seven_day_omelette":   "7-day Pro",
 }
 
+# Window duration per tier label, in seconds. Used to render the time-elapsed
+# bar under each row. Labels not in this map omit the time bar.
+TIER_WINDOW_S = {
+    "5-hour":        5 * 3600,
+    "7-day":         7 * 86400,
+    "7-day Opus":    7 * 86400,
+    "7-day Sonnet":  7 * 86400,
+    "7-day Apps":    7 * 86400,
+    "7-day Cowork":  7 * 86400,
+    "7-day Pro":     7 * 86400,
+}
+
+
+def _time_progress(resets_at_iso: str, window_s: int | None) -> float | None:
+    """Return 0..1 = fraction of the window elapsed; None if window unknown."""
+    if not window_s or not resets_at_iso:
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(resets_at_iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    remaining = (dt - datetime.now(timezone.utc)).total_seconds()
+    if remaining <= 0:
+        return 1.0
+    if remaining >= window_s:
+        return 0.0
+    return 1.0 - (remaining / window_s)
+
 
 def _fmt_countdown(resets_at_iso: str) -> str:
     from datetime import datetime, timezone
@@ -173,17 +202,22 @@ def _fmt_countdown(resets_at_iso: str) -> str:
     return f"resets in {h}h {m}m" if h else f"resets in {m}m"
 
 
-def parse_usage(data: dict) -> list[tuple[str, float, str]]:
-    """Convert the API response into [(label, utilization 0..1, sublabel), ...]."""
-    rows: list[tuple[str, float, str]] = []
+Row = tuple[str, float, str, float | None]
+# (label, utilization 0..1, sublabel, time_progress 0..1 or None)
+
+
+def parse_usage(data: dict) -> list[Row]:
+    rows: list[Row] = []
 
     for key, label in TIER_LABELS.items():
         tier = data.get(key)
         if not tier or tier.get("utilization") is None:
             continue
+        resets_at = tier.get("resets_at") or ""
         util      = float(tier["utilization"]) / 100.0
-        countdown = _fmt_countdown(tier.get("resets_at") or "")
-        rows.append((label, util, countdown))
+        countdown = _fmt_countdown(resets_at)
+        elapsed   = _time_progress(resets_at, TIER_WINDOW_S.get(label))
+        rows.append((label, util, countdown, elapsed))
 
     extra = data.get("extra_usage")
     if extra and extra.get("is_enabled"):
@@ -191,7 +225,7 @@ def parse_usage(data: dict) -> list[tuple[str, float, str]]:
         limit = float(extra.get("monthly_limit") or 0)
         util  = used / limit if limit > 0 else 0.0
         cur   = extra.get("currency", "USD")
-        rows.append(("Extra credits", util, f"{cur} {used:.2f} / {limit:.2f}"))
+        rows.append(("Extra credits", util, f"{cur} {used:.2f} / {limit:.2f}", None))
 
     return rows
 
@@ -210,6 +244,10 @@ ACCENT_OFF   = "#444444"
 SEPARATOR    = "#333333"
 BTN_BG       = "#2a2a2a"
 BTN_BG_HOVER = "#3a3a3a"
+TIME_BAR_BG  = "#262626"   # slightly darker than BAR_BG
+TIME_BAR_FG  = "#ffffff"
+BAR_H        = 5
+TIME_BAR_H   = 3            # roughly half of BAR_H
 WIDTH        = 220
 
 # Discrete refresh-timer presets, in minutes.
@@ -240,7 +278,7 @@ class UsageWidget(tk.Tk):
         self._hidden: set[str] = set(self._settings.get("hidden", []))
         self._refresh_min = self._init_refresh_minutes()
         self._manage_mode = False
-        self._last_rows: list[tuple[str, float, str]] = []
+        self._last_rows: list[Row] = []
         self._destroyed   = False
         self._fetch_in_flight = False
         self._next_after_id: str | None = None
@@ -368,7 +406,7 @@ class UsageWidget(tk.Tk):
         self._after_safe(next_delay_s * 1000, self._schedule_refresh,
                          remember_id=True)
 
-    def _on_fetch_success(self, rows: list[tuple[str, float, str]]) -> None:
+    def _on_fetch_success(self, rows: list[Row]) -> None:
         self._render(rows)
         self._ts_lbl.config(text=time.strftime("Updated %H:%M:%S"))
 
@@ -386,7 +424,7 @@ class UsageWidget(tk.Tk):
 
     # ── render ────────────────────────────────────────────────────────────────
 
-    def _render(self, rows: list[tuple[str, float, str]]) -> None:
+    def _render(self, rows: list[Row]) -> None:
         self._last_rows = rows
         for w in self._body.winfo_children():
             w.destroy()
@@ -495,11 +533,13 @@ class UsageWidget(tk.Tk):
         unit = "min" if minutes == 1 else "min"
         return f"Refresh timer: {minutes} {unit}"
 
-    def _add_row(self, label: str, util: float, sub: str) -> None:
+    def _add_row(self, label: str, util: float, sub: str,
+                 time_progress: float | None) -> None:
         pct        = min(int(util * 100), 100)
         hidden     = label in self._hidden
         active_fg  = FG_DIM if hidden else FG
         active_bar = FG_DIM if hidden else bar_color(util)
+        time_fg    = FG_DIM if hidden else TIME_BAR_FG
 
         row = tk.Frame(self._body, bg=BG)
         row.pack(fill="x", pady=(4, 0))
@@ -518,11 +558,22 @@ class UsageWidget(tk.Tk):
         tk.Label(top, text=f"{pct}%", bg=BG, fg=active_bar,
                  font=("Segoe UI", 8, "bold")).pack(side="right")
 
-        bar_frame = tk.Frame(row, bg=BAR_BG, height=5)
-        bar_frame.pack(fill="x", pady=(2, 0))
-        bar_frame.pack_propagate(False)
-        tk.Frame(bar_frame, bg=active_bar, height=5).place(
+        # Usage bar
+        usage_bar = tk.Frame(row, bg=BAR_BG, height=BAR_H)
+        usage_bar.pack(fill="x", pady=(2, 0))
+        usage_bar.pack_propagate(False)
+        tk.Frame(usage_bar, bg=active_bar, height=BAR_H).place(
             relx=0, rely=0, relwidth=min(max(util, 0.0), 1.0), relheight=1.0)
+
+        # Time-elapsed bar (flush under the usage bar, no spacing)
+        if time_progress is not None:
+            time_bar = tk.Frame(row, bg=TIME_BAR_BG, height=TIME_BAR_H)
+            time_bar.pack(fill="x", pady=0)
+            time_bar.pack_propagate(False)
+            tk.Frame(time_bar, bg=time_fg, height=TIME_BAR_H).place(
+                relx=0, rely=0,
+                relwidth=min(max(time_progress, 0.0), 1.0),
+                relheight=1.0)
 
         if sub:
             tk.Label(row, text=sub, bg=BG, fg=FG_DIM,
