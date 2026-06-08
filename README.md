@@ -23,7 +23,7 @@ A small always-on-top floating window for Windows that shows your Claude.ai plan
 ## Install
 
 ```powershell
-git clone https://github.com/<your-username>/claude-usage-widget.git
+git clone https://github.com/JosephBurgan/claude-usage-widget.git
 cd claude-usage-widget
 pip install -r requirements.txt
 ```
