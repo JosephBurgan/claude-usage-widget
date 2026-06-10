@@ -190,7 +190,10 @@ def check_for_update() -> tuple[str, str]:
 
 
 def install_update() -> str | None:
-    """Run `git pull --ff-only`. Return None on success, error string otherwise."""
+    """Run `git pull --ff-only` then `pip install -r requirements.txt`.
+
+    Returns None on success, error string otherwise.
+    """
     try:
         r = _git("pull", "--ff-only", "origin", "main", timeout=30)
     except FileNotFoundError:
@@ -199,6 +202,27 @@ def install_update() -> str | None:
         return "git pull timed out"
     if r.returncode != 0:
         return (r.stderr or r.stdout or "git pull failed").strip()
+
+    # Sync Python dependencies in case requirements.txt changed.
+    req = REPO_DIR / "requirements.txt"
+    if req.exists():
+        # Use python.exe rather than pythonw.exe so pip has stdio.
+        py = Path(sys.executable).with_name("python.exe")
+        if not py.exists():
+            py = Path(sys.executable)
+        try:
+            pip = subprocess.run(
+                [str(py), "-m", "pip", "install", "--quiet", "--user",
+                 "-r", str(req)],
+                cwd=REPO_DIR,
+                capture_output=True, text=True, timeout=180,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if pip.returncode != 0:
+                err = (pip.stderr or pip.stdout or "?").strip()
+                return f"pip install failed: {err[:200]}"
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            return f"pip install error: {exc}"
     return None
 
 
