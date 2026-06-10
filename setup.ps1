@@ -20,21 +20,18 @@ Need-Command git    "Install Git from git-scm.com or GitHub Desktop."
 Write-Host "Installing Python dependencies..." -ForegroundColor Cyan
 python -m pip install --quiet --user -r (Join-Path $repo "requirements.txt")
 
-Write-Host "Creating Start Menu and Startup shortcuts..." -ForegroundColor Cyan
-$sh   = New-Object -ComObject WScript.Shell
-$dirs = @(
-  [Environment]::GetFolderPath("Startup"),
-  (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs")
-)
-foreach ($dir in $dirs) {
-  $lnk = $sh.CreateShortcut((Join-Path $dir "Claude Usage Widget.lnk"))
-  $lnk.TargetPath       = "wscript.exe"
-  $lnk.Arguments        = "`"$vbs`""
-  $lnk.WorkingDirectory = $repo
-  if (Test-Path $icon) { $lnk.IconLocation = $icon }
-  $lnk.Description      = "Floating Claude usage widget"
-  $lnk.Save()
-}
+Write-Host "Creating Start Menu shortcut..." -ForegroundColor Cyan
+$sh  = New-Object -ComObject WScript.Shell
+$dir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
+$lnk = $sh.CreateShortcut((Join-Path $dir "Claude Usage Widget.lnk"))
+$lnk.TargetPath       = "wscript.exe"
+$lnk.Arguments        = "`"$vbs`""
+$lnk.WorkingDirectory = $repo
+if (Test-Path $icon) { $lnk.IconLocation = $icon }
+$lnk.Description      = "Floating Claude usage widget"
+$lnk.Save()
+
+# Note: "Launch on startup" is opt-in via the widget's settings panel.
 
 Write-Host "Launching the widget..." -ForegroundColor Cyan
 Start-Process wscript -ArgumentList "`"$vbs`""

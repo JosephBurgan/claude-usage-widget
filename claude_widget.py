@@ -202,6 +202,54 @@ def install_update() -> str | None:
     return None
 
 
+def startup_shortcut_path() -> Path:
+    return (Path(os.environ["APPDATA"]) / "Microsoft" / "Windows"
+            / "Start Menu" / "Programs" / "Startup"
+            / "Claude Usage Widget.lnk")
+
+
+def is_startup_enabled() -> bool:
+    return startup_shortcut_path().exists()
+
+
+def set_startup_enabled(enabled: bool) -> str | None:
+    """Create or remove the Startup shortcut. None on success, error string otherwise."""
+    path = startup_shortcut_path()
+    if not enabled:
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError as exc:
+            return str(exc)
+        return None
+
+    vbs  = REPO_DIR / "claude_widget.vbs"
+    icon = REPO_DIR / "claude_widget.ico"
+    if not vbs.exists():
+        return f"Launcher not found: {vbs}"
+    ps = (
+        f'$sh = New-Object -ComObject WScript.Shell;'
+        f'$lnk = $sh.CreateShortcut("{path}");'
+        f'$lnk.TargetPath = "wscript.exe";'
+        f"$lnk.Arguments = '\"{vbs}\"';"
+        f'$lnk.WorkingDirectory = "{REPO_DIR}";'
+        + (f'$lnk.IconLocation = "{icon}";' if icon.exists() else "")
+        + '$lnk.Description = "Floating Claude usage widget";'
+          '$lnk.Save()'
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return str(exc)
+    if r.returncode != 0:
+        return (r.stderr or "Failed to create shortcut").strip()
+    return None
+
+
 def relaunch_widget() -> None:
     """Spawn a fresh widget process via the VBS launcher, then exit this one."""
     vbs = REPO_DIR / "claude_widget.vbs"
@@ -378,6 +426,9 @@ class UsageWidget(tk.Tk):
         self._update_detail      = ""        # SHA when available, error msg when error
         self._update_frame: tk.Frame | None = None
 
+        # Tray state
+        self._tray = None  # set by _setup_tray if pystray is available
+
         self._build_ui()
         self._apply_icon()
         self.update_idletasks()
@@ -385,6 +436,7 @@ class UsageWidget(tk.Tk):
         self.lift()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._setup_tray()
         self._schedule_refresh()
 
     # ── layout ────────────────────────────────────────────────────────────────
@@ -399,15 +451,17 @@ class UsageWidget(tk.Tk):
         title.pack(side="left")
         self._bind_drag(title)
 
-        # Header buttons (right-to-left order in the layout)
-        close = self._make_icon_btn(hdr, "✕", self._on_close)
+        # Header buttons (right-to-left order in the layout).
+        close = self._make_icon_btn(hdr, "✕", self._on_close, size=11)
         close.pack(side="right", padx=(0, 4))
 
         self._gear_btn = self._make_icon_btn(hdr, "≡", self._toggle_manage, size=12)
-        self._gear_btn.pack(side="right", padx=(0, 4))
+        self._gear_btn.pack(side="right", padx=(0, 6))
 
-        self._pin_btn = self._make_icon_btn(hdr, "📌", self._toggle_topmost)
-        self._pin_btn.pack(side="right", padx=(0, 2))
+        self._pin_btn = self._make_icon_btn(hdr, "📌", self._toggle_topmost, size=9)
+        self._pin_btn.pack(side="right", padx=(12, 6))
+        # Pin starts pinned (white) since the window initializes topmost
+        self._pin_btn.config(fg="white")
 
         tk.Frame(self, bg=SEPARATOR, height=1).pack(fill="x", padx=6, pady=(0, 4))
 
@@ -421,9 +475,10 @@ class UsageWidget(tk.Tk):
         self._ts_lbl = tk.Label(self, bg=BG, fg=FG_DIM, font=("Segoe UI", 7))
         self._ts_lbl.pack(anchor="e", padx=8, pady=(0, 4))
 
-    def _make_icon_btn(self, parent: tk.Misc, text: str, cb, size: int = 9) -> tk.Label:
+    def _make_icon_btn(self, parent: tk.Misc, text: str, cb, size: int = 11) -> tk.Label:
         lbl = tk.Label(parent, text=text, bg=BG, fg=ACCENT,
-                       font=("Segoe UI", size), cursor="hand2")
+                       font=("Segoe UI", size), cursor="hand2",
+                       bd=0, padx=0, pady=0)
         lbl.bind("<Button-1>", lambda _e: cb())
         return lbl
 
@@ -448,8 +503,82 @@ class UsageWidget(tk.Tk):
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     def _on_close(self) -> None:
+        """Close button. If the user opted in (and the tray is up), hide; else quit."""
+        if self._tray is not None and self._settings.get("minimize_on_close", False):
+            self.withdraw()
+        else:
+            self._quit_app()
+
+    def _quit_app(self) -> None:
+        """Fully exit: stop tray loop, destroy window."""
         self._destroyed = True
-        self.destroy()
+        if self._tray is not None:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
+            self._tray = None
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+    def _show_and_raise(self) -> None:
+        """Reveal the widget and bring it above other windows."""
+        if self.state() == "withdrawn":
+            self.deiconify()
+        self.lift()
+        # Force topmost briefly so we surface over other apps. If the user
+        # hasn't pinned us, drop the topmost flag again after a moment so
+        # the window doesn't permanently stick.
+        self.attributes("-topmost", True)
+        if not self._on_top:
+            self.after(150, lambda: self.attributes("-topmost", False))
+
+    def _hide_window(self) -> None:
+        self.withdraw()
+
+    # ── tray ──────────────────────────────────────────────────────────────────
+
+    def _setup_tray(self) -> None:
+        """Create a system-tray icon. No-op if pystray or Pillow isn't installed."""
+        try:
+            import pystray
+            from PIL import Image
+        except ImportError:
+            return
+
+        png = REPO_DIR / "claude_widget.png"
+        if not png.exists():
+            return
+        try:
+            image = Image.open(png)
+        except Exception:
+            return
+
+        # All tray-thread callbacks marshal back to the UI thread via after().
+        def show(icon=None, item=None):
+            self._after_safe(0, self._show_and_raise)
+
+        def hide(icon=None, item=None):
+            self._after_safe(0, self._hide_window)
+
+        def refresh_now(icon=None, item=None):
+            self._after_safe(0, self._manual_refresh)
+
+        def quit_app(icon=None, item=None):
+            self._after_safe(0, self._quit_app)
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Show", show, default=True),
+            pystray.MenuItem("Hide", hide),
+            pystray.MenuItem("Refresh now", refresh_now),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", quit_app),
+        )
+        self._tray = pystray.Icon("claude-usage-widget", image,
+                                  "Claude Usage", menu)
+        threading.Thread(target=self._tray.run, daemon=True).start()
 
     def _after_safe(self, *args, remember_id: bool = False, **kwargs) -> None:
         """`self.after` that silently no-ops if the window has been destroyed.
@@ -480,7 +609,7 @@ class UsageWidget(tk.Tk):
     def _toggle_topmost(self) -> None:
         self._on_top = not self._on_top
         self.attributes("-topmost", self._on_top)
-        self._pin_btn.config(fg=ACCENT if self._on_top else ACCENT_OFF)
+        self._pin_btn.config(fg="white" if self._on_top else ACCENT)
 
     # ── refresh loop ──────────────────────────────────────────────────────────
 
@@ -573,7 +702,78 @@ class UsageWidget(tk.Tk):
         scale.set(MINUTE_PRESETS.index(self._refresh_min))
         scale.pack(fill="x")
 
-        tk.Frame(self._body, bg=SEPARATOR, height=1).pack(fill="x", pady=(0, 4))
+        # ── boolean options ──
+        opts = tk.Frame(panel, bg=BG)
+        opts.pack(fill="x", pady=(6, 0))
+
+        self._make_checkbox(
+            opts, "Launch on startup",
+            get_state=is_startup_enabled,
+            set_state=set_startup_enabled,
+        )
+        self._make_checkbox(
+            opts, "Keep minimized on close",
+            get_state=lambda: self._settings.get("minimize_on_close", False),
+            set_state=self._set_minimize_on_close,
+        )
+
+        tk.Frame(self._body, bg=SEPARATOR, height=1).pack(fill="x", pady=(4, 4))
+
+    def _set_minimize_on_close(self, enabled: bool) -> str | None:
+        self._settings["minimize_on_close"] = bool(enabled)
+        try:
+            save_settings(self._settings)
+        except OSError as exc:
+            return str(exc)
+        return None
+
+    def _make_checkbox(self, parent: tk.Misc, label: str,
+                        get_state, set_state) -> tk.Frame:
+        """Settings-row checkbox styled to match the row hide checkboxes.
+
+        get_state: () -> bool
+        set_state: (new_value: bool) -> str | None   (returns error or None)
+        """
+        row = tk.Frame(parent, bg=BG)
+        row.pack(fill="x", pady=(2, 0))
+
+        state = {"on": bool(get_state())}
+
+        box = tk.Label(row, text="☑" if state["on"] else "☐",
+                       bg=BG, fg=FG, font=("Segoe UI", 9),
+                       cursor="hand2", bd=0, padx=0, pady=0)
+        box.pack(side="left", padx=(0, 4))
+
+        lbl = tk.Label(row, text=label, bg=BG, fg=FG,
+                       font=("Segoe UI", 8), cursor="hand2",
+                       bd=0, padx=0, pady=0)
+        lbl.pack(side="left")
+
+        err_lbl: list[tk.Label] = []
+
+        def toggle(_e=None):
+            new = not state["on"]
+            err = set_state(new)
+            if err:
+                if not err_lbl:
+                    e = tk.Label(row, text=err, bg=BG, fg=BAR_HIGH,
+                                 font=("Segoe UI", 7),
+                                 wraplength=WIDTH - 30, justify="left",
+                                 bd=0, padx=0, pady=0)
+                    e.pack(anchor="w")
+                    err_lbl.append(e)
+                else:
+                    err_lbl[0].config(text=err)
+                return
+            state["on"] = new
+            box.config(text="☑" if new else "☐")
+            if err_lbl:
+                err_lbl[0].destroy()
+                err_lbl.clear()
+
+        box.bind("<Button-1>", toggle)
+        lbl.bind("<Button-1>", toggle)
+        return row
 
     def _make_action_button(self, parent: tk.Misc, text: str, cb) -> tk.Label:
         btn = tk.Label(parent, text=text,
@@ -714,6 +914,12 @@ class UsageWidget(tk.Tk):
 
     def _do_relaunch(self) -> None:
         self._destroyed = True
+        if self._tray is not None:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
+            self._tray = None
         try:
             self.destroy()
         except tk.TclError:
