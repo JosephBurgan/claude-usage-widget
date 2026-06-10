@@ -157,12 +157,23 @@ def is_git_checkout() -> bool:
     return (REPO_DIR / ".git").exists()
 
 
-def current_short_sha() -> str:
+def current_version() -> str:
+    """Human-readable version: the latest tag (e.g. `v1.0.0`), or `<tag>+N` if
+    the working tree is N commits past it, or a short SHA if no tags exist."""
     if not is_git_checkout():
         return "unknown"
     try:
-        r = _git("rev-parse", "--short", "HEAD")
-        return r.stdout.strip() if r.returncode == 0 else "unknown"
+        r = _git("describe", "--tags", "--always", "--abbrev=7")
+        if r.returncode != 0 or not r.stdout.strip():
+            return "unknown"
+        desc = r.stdout.strip()
+        # `git describe --tags` returns either an exact tag (e.g. `v1.0.0`),
+        # `<tag>-<n>-g<sha>` (post-tag commit), or a bare short SHA.
+        # Rewrite `<tag>-<n>-g<sha>` to `<tag>+<n>` for a cleaner display.
+        parts = desc.rsplit("-", 2)
+        if len(parts) == 3 and parts[2].startswith("g"):
+            return f"{parts[0]}+{parts[1]}"
+        return desc
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return "unknown"
 
@@ -445,7 +456,7 @@ class UsageWidget(tk.Tk):
         self._next_after_id: str | None = None
 
         # Self-update state
-        self._version            = current_short_sha()
+        self._version            = current_version()
         self._update_state       = "idle"   # idle, checking, current, available, installing, error
         self._update_detail      = ""        # SHA when available, error msg when error
         self._update_frame: tk.Frame | None = None
