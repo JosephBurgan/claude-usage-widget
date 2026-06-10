@@ -65,6 +65,10 @@ def save_settings(s: dict) -> None:
     _write_json_atomic(SETTINGS_FILE, s)
 
 
+# Rows hidden by default on first launch (user can re-enable from settings).
+DEFAULT_HIDDEN = ["7-day Sonnet", "Extra credits"]
+
+
 # ── OAuth / API ──────────────────────────────────────────────────────────────
 
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -355,7 +359,12 @@ class UsageWidget(tk.Tk):
         self._drag_x      = 0
         self._drag_y      = 0
         self._settings    = load_settings()
-        self._hidden: set[str] = set(self._settings.get("hidden", []))
+        if "hidden" not in self._settings:
+            # First launch: seed with sensible defaults so the user can re-enable
+            # any of them from the settings panel.
+            self._settings["hidden"] = list(DEFAULT_HIDDEN)
+            save_settings(self._settings)
+        self._hidden: set[str] = set(self._settings["hidden"])
         self._refresh_min = self._init_refresh_minutes()
         self._manage_mode = False
         self._last_rows: list[Row] = []
@@ -370,6 +379,7 @@ class UsageWidget(tk.Tk):
         self._update_frame: tk.Frame | None = None
 
         self._build_ui()
+        self._apply_icon()
         self.update_idletasks()
         self._place_bottom_right()
         self.lift()
@@ -420,6 +430,15 @@ class UsageWidget(tk.Tk):
     def _bind_drag(self, widget: tk.Misc) -> None:
         widget.bind("<ButtonPress-1>", self._drag_start)
         widget.bind("<B1-Motion>",     self._drag_move)
+
+    def _apply_icon(self) -> None:
+        icon = REPO_DIR / "claude_widget.ico"
+        if not icon.exists():
+            return
+        try:
+            self.iconbitmap(default=str(icon))
+        except tk.TclError:
+            pass
 
     def _place_bottom_right(self) -> None:
         sw = self.winfo_screenwidth()
@@ -632,38 +651,41 @@ class UsageWidget(tk.Tk):
                  bd=0, padx=0, pady=0).pack(anchor="w")
 
         state, detail = self._update_state, self._update_detail
-        if state == "idle":
-            self._make_action_button(
-                frame, "Check for updates", self._on_check_update
-            ).pack(fill="x", pady=(2, 0))
-        elif state == "checking":
-            tk.Label(frame, text="Checking…", bg=BG, fg=FG_DIM,
-                     font=("Segoe UI", 8), bd=0, padx=0, pady=0
-                     ).pack(anchor="w", pady=(2, 0))
-        elif state == "current":
-            tk.Label(frame, text="✓ Up to date", bg=BG, fg=BAR_LOW,
-                     font=("Segoe UI", 8), bd=0, padx=0, pady=0
-                     ).pack(anchor="w", pady=(2, 0))
+
+        # Button: label and action change based on state. Always present.
+        if state in ("checking", "installing"):
+            label  = "Checking…" if state == "checking" else "Installing…"
+            action = None
         elif state == "available":
-            tk.Label(frame, text=f"Update available ({detail})",
-                     bg=BG, fg=FG, font=("Segoe UI", 8),
-                     bd=0, padx=0, pady=0
-                     ).pack(anchor="w", pady=(2, 0))
-            self._make_action_button(
-                frame, "Install update", self._on_install_update
-            ).pack(fill="x", pady=(2, 0))
-        elif state == "installing":
-            tk.Label(frame, text="Installing…", bg=BG, fg=FG_DIM,
-                     font=("Segoe UI", 8), bd=0, padx=0, pady=0
-                     ).pack(anchor="w", pady=(2, 0))
+            label  = "Update"
+            action = self._on_install_update
+        else:  # idle / current / error
+            label  = "Check for updates"
+            action = self._on_check_update
+
+        btn = self._make_action_button(frame, label, action or (lambda: None))
+        if action is None:
+            # Disabled-looking button while a worker is running.
+            btn.config(fg=FG_DIM, cursor="arrow")
+            btn.unbind("<Button-1>")
+            btn.unbind("<Enter>")
+            btn.unbind("<Leave>")
+        btn.pack(fill="x", pady=(2, 0))
+
+        # Status text below the button.
+        status_text, status_fg, status_font_size = "", FG_DIM, 8
+        if state == "current":
+            status_text, status_fg = "✓ Up to date", BAR_LOW
+        elif state == "available":
+            status_text, status_fg = f"Update available ({detail})", FG
         elif state == "error":
-            tk.Label(frame, text=detail, bg=BG, fg=BAR_HIGH,
-                     font=("Segoe UI", 7), wraplength=WIDTH - 20,
-                     justify="left", bd=0, padx=0, pady=0
-                     ).pack(anchor="w", pady=(2, 0))
-            self._make_action_button(
-                frame, "Try again", self._on_check_update
-            ).pack(fill="x", pady=(2, 0))
+            status_text, status_fg, status_font_size = detail, BAR_HIGH, 7
+
+        if status_text:
+            tk.Label(frame, text=status_text, bg=BG, fg=status_fg,
+                     font=("Segoe UI", status_font_size),
+                     wraplength=WIDTH - 20, justify="left",
+                     bd=0, padx=0, pady=0).pack(anchor="w", pady=(2, 0))
 
     def _set_update_state(self, state: str, detail: str = "") -> None:
         self._update_state  = state

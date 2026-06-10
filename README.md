@@ -25,40 +25,25 @@ A small always-on-top floating window for Windows that shows your Claude.ai plan
 ```powershell
 git clone https://github.com/JosephBurgan/claude-usage-widget.git
 cd claude-usage-widget
-pip install -r requirements.txt
+powershell -ExecutionPolicy Bypass -File setup.ps1
 ```
+
+The setup script installs the Python dependency, creates Start Menu and Startup
+shortcuts (with the widget icon), and launches the widget.
 
 Make sure you've run `claude` at least once and logged in — the widget needs the
 credentials file that Claude Code creates at `%USERPROFILE%\.claude\.credentials.json`.
 
-## Run
+## Update
 
-Double-click `claude_widget.vbs`. The widget appears in the bottom-right of your screen.
+Click ☰ on the widget → **Check for updates** → if available, click **Update**.
+That runs `git pull` and relaunches the widget automatically.
 
-(The `.vbs` launcher runs the widget with `pythonw.exe` so no console window appears.
-You can also run `python claude_widget.py` directly if you prefer.)
-
-## Start with Windows
-
-Place a shortcut to `claude_widget.vbs` in your Startup folder:
-
-1. Press <kbd>Win</kbd>+<kbd>R</kbd>, type `shell:startup`, hit Enter
-2. Right-click in that folder → New → Shortcut
-3. Target: `wscript.exe "C:\path\to\claude-usage-widget\claude_widget.vbs"`
-
-Or run this PowerShell snippet to create both a Start Menu and Startup shortcut:
+Or manually:
 
 ```powershell
-$repo  = "C:\path\to\claude-usage-widget"
-$sh    = New-Object -ComObject WScript.Shell
-foreach ($dir in @([Environment]::GetFolderPath("Startup"),
-                   "$env:APPDATA\Microsoft\Windows\Start Menu\Programs")) {
-  $lnk = $sh.CreateShortcut("$dir\Claude Usage Widget.lnk")
-  $lnk.TargetPath       = "wscript.exe"
-  $lnk.Arguments        = "`"$repo\claude_widget.vbs`""
-  $lnk.WorkingDirectory = $repo
-  $lnk.Save()
-}
+cd C:\path\to\claude-usage-widget
+git pull
 ```
 
 ## How it works
