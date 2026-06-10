@@ -432,7 +432,7 @@ class UsageWidget(tk.Tk):
         self._build_ui()
         self._apply_icon()
         self.update_idletasks()
-        self._place_bottom_right()
+        self._place_initial()
         self.lift()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -487,8 +487,9 @@ class UsageWidget(tk.Tk):
         return lbl
 
     def _bind_drag(self, widget: tk.Misc) -> None:
-        widget.bind("<ButtonPress-1>", self._drag_start)
-        widget.bind("<B1-Motion>",     self._drag_move)
+        widget.bind("<ButtonPress-1>",   self._drag_start)
+        widget.bind("<B1-Motion>",       self._drag_move)
+        widget.bind("<ButtonRelease-1>", lambda _e: self._save_position())
 
     def _apply_icon(self) -> None:
         icon = REPO_DIR / "claude_widget.ico"
@@ -504,6 +505,30 @@ class UsageWidget(tk.Tk):
         sh = self.winfo_screenheight()
         self.geometry(f"+{sw - WIDTH - 20}+{sh - 220}")
 
+    def _place_initial(self) -> None:
+        """Restore last-known position if the user opted in, else bottom-right."""
+        if self._settings.get("remember_position", True):
+            x = self._settings.get("window_x")
+            y = self._settings.get("window_y")
+            if isinstance(x, int) and isinstance(y, int):
+                sw = self.winfo_screenwidth()
+                sh = self.winfo_screenheight()
+                # Sanity-check: window must remain visible (allow small overflow).
+                if -100 < x < sw - 50 and -100 < y < sh - 50:
+                    self.geometry(f"+{x}+{y}")
+                    return
+        self._place_bottom_right()
+
+    def _save_position(self) -> None:
+        if not self._settings.get("remember_position", True):
+            return
+        try:
+            self._settings["window_x"] = int(self.winfo_x())
+            self._settings["window_y"] = int(self.winfo_y())
+            save_settings(self._settings)
+        except (OSError, tk.TclError):
+            pass
+
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     def _on_close(self) -> None:
@@ -515,6 +540,7 @@ class UsageWidget(tk.Tk):
 
     def _quit_app(self) -> None:
         """Fully exit: stop tray loop, destroy window."""
+        self._save_position()
         self._destroyed = True
         if self._tray is not None:
             try:
@@ -688,7 +714,7 @@ class UsageWidget(tk.Tk):
 
     def _add_update_banner(self) -> None:
         btn = tk.Label(
-            self._body, text="↑  New update — Click here",
+            self._body, text="Download Update",
             bg=BTN_BG, fg="white",
             font=("Segoe UI", 8, "bold"),
             cursor="hand2", pady=4,
@@ -736,11 +762,29 @@ class UsageWidget(tk.Tk):
             get_state=lambda: self._settings.get("minimize_on_close", False),
             set_state=self._set_minimize_on_close,
         )
+        self._make_checkbox(
+            opts, "Re-open widget in same position",
+            get_state=lambda: self._settings.get("remember_position", True),
+            set_state=self._set_remember_position,
+        )
 
         tk.Frame(self._body, bg=SEPARATOR, height=1).pack(fill="x", pady=(4, 4))
 
     def _set_minimize_on_close(self, enabled: bool) -> str | None:
         self._settings["minimize_on_close"] = bool(enabled)
+        try:
+            save_settings(self._settings)
+        except OSError as exc:
+            return str(exc)
+        return None
+
+    def _set_remember_position(self, enabled: bool) -> str | None:
+        self._settings["remember_position"] = bool(enabled)
+        if enabled:
+            # Capture the current position right now so a later restart
+            # uses it even if the user never drags the window again.
+            self._settings["window_x"] = int(self.winfo_x())
+            self._settings["window_y"] = int(self.winfo_y())
         try:
             save_settings(self._settings)
         except OSError as exc:
@@ -877,7 +921,7 @@ class UsageWidget(tk.Tk):
             label  = "Checking…" if state == "checking" else "Installing…"
             action = None
         elif state == "available":
-            label  = "Update"
+            label  = "Download Update"
             action = self._on_install_update
         else:  # idle / current / error
             label  = "Check for updates"
@@ -896,8 +940,6 @@ class UsageWidget(tk.Tk):
         status_text, status_fg, status_font_size = "", FG_DIM, 8
         if state == "current":
             status_text, status_fg = "✓ Up to date", BAR_LOW
-        elif state == "available":
-            status_text, status_fg = f"Update available ({detail})", FG
         elif state == "error":
             status_text, status_fg, status_font_size = detail, BAR_HIGH, 7
 
