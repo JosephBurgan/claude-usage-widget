@@ -1,5 +1,6 @@
 # Claude Usage Widget
 
+
 A small always-on-top floating window for Windows that shows your Claude.ai plan usage (5-hour, 7-day, Sonnet-only, extra credits) with live progress bars and reset countdowns. Refreshes every 30 seconds.
 
 ![widget](docs/screenshot.png)
