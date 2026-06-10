@@ -452,6 +452,9 @@ class UsageWidget(tk.Tk):
 
         # Tray state
         self._tray = None  # set by _setup_tray if pystray is available
+        self._deps_missing      = not self._has_tray_deps()
+        self._deps_install_state = "idle"   # idle, installing, error
+        self._deps_install_error = ""
 
         self._build_ui()
         self._apply_icon()
@@ -724,6 +727,8 @@ class UsageWidget(tk.Tk):
             # Settings panel hides the banner so we don't duplicate the call-to-action.
             if self._update_state == "available":
                 self._add_update_banner()
+            elif self._deps_missing:
+                self._add_deps_banner()
             visible = [r for r in rows if r[0] not in self._hidden]
 
         if not visible and not self._manage_mode:
@@ -748,6 +753,81 @@ class UsageWidget(tk.Tk):
         btn.bind("<Button-1>", lambda _e: self._on_install_update())
         btn.bind("<Enter>",   lambda _e: btn.config(bg=BTN_BG_HOVER))
         btn.bind("<Leave>",   lambda _e: btn.config(bg=BTN_BG))
+
+    @staticmethod
+    def _has_tray_deps() -> bool:
+        try:
+            import pystray  # noqa: F401
+            from PIL import Image  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def _add_deps_banner(self) -> None:
+        s = self._deps_install_state
+        if s == "installing":
+            text, clickable = "Installing…", False
+        elif s == "error":
+            text, clickable = "Install failed — Click to retry", True
+        else:
+            text, clickable = "Install missing tray icon", True
+
+        btn = tk.Label(
+            self._body, text=text,
+            bg=BTN_BG, fg="white",
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2" if clickable else "watch",
+            pady=4, bd=0, padx=0,
+        )
+        btn.pack(fill="x", pady=(0, 6))
+        if clickable:
+            btn.bind("<Button-1>", lambda _e: self._on_install_deps())
+            btn.bind("<Enter>",   lambda _e: btn.config(bg=BTN_BG_HOVER))
+            btn.bind("<Leave>",   lambda _e: btn.config(bg=BTN_BG))
+
+        if s == "error" and self._deps_install_error:
+            tk.Label(self._body, text=self._deps_install_error,
+                     bg=BG, fg=BAR_HIGH, font=("Segoe UI", 7),
+                     wraplength=WIDTH - 20, justify="left",
+                     bd=0, padx=0, pady=0).pack(anchor="w", pady=(0, 4))
+
+    def _on_install_deps(self) -> None:
+        if self._deps_install_state == "installing":
+            return
+        self._deps_install_state = "installing"
+        self._deps_install_error = ""
+        if self._last_rows:
+            self._render(self._last_rows)
+        threading.Thread(target=self._do_install_deps, daemon=True).start()
+
+    def _do_install_deps(self) -> None:
+        req = REPO_DIR / "requirements.txt"
+        py  = Path(sys.executable).with_name("python.exe")
+        if not py.exists():
+            py = Path(sys.executable)
+        try:
+            r = subprocess.run(
+                [str(py), "-m", "pip", "install", "--quiet", "--user",
+                 "-r", str(req)],
+                cwd=REPO_DIR,
+                capture_output=True, text=True, timeout=180,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self._after_safe(0, self._deps_install_done, str(exc))
+            return
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "?").strip()[:200]
+            self._after_safe(0, self._deps_install_done, err)
+            return
+        # Success — relaunch so the new modules can be imported.
+        self._after_safe(0, self._do_relaunch)
+
+    def _deps_install_done(self, error: str) -> None:
+        self._deps_install_state = "error"
+        self._deps_install_error = error
+        if self._last_rows:
+            self._render(self._last_rows)
 
     def _add_settings_panel(self) -> None:
         panel = tk.Frame(self._body, bg=BG)
