@@ -439,6 +439,10 @@ class UsageWidget(tk.Tk):
         self._setup_tray()
         self._schedule_refresh()
 
+        # Auto-check for updates a few seconds after startup so we don't
+        # delay first paint.
+        self.after(5000, self._auto_check_for_update)
+
     # ── layout ────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
@@ -667,6 +671,9 @@ class UsageWidget(tk.Tk):
             self._add_settings_panel()
             visible = rows
         else:
+            # Settings panel hides the banner so we don't duplicate the call-to-action.
+            if self._update_state == "available":
+                self._add_update_banner()
             visible = [r for r in rows if r[0] not in self._hidden]
 
         if not visible and not self._manage_mode:
@@ -678,6 +685,19 @@ class UsageWidget(tk.Tk):
                 self._add_row(*row)
 
         self.update_idletasks()
+
+    def _add_update_banner(self) -> None:
+        btn = tk.Label(
+            self._body, text="↑  New update — Click here",
+            bg=BTN_BG, fg="white",
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2", pady=4,
+            bd=0, padx=0,
+        )
+        btn.pack(fill="x", pady=(0, 6))
+        btn.bind("<Button-1>", lambda _e: self._on_install_update())
+        btn.bind("<Enter>",   lambda _e: btn.config(bg=BTN_BG_HOVER))
+        btn.bind("<Leave>",   lambda _e: btn.config(bg=BTN_BG))
 
     def _add_settings_panel(self) -> None:
         panel = tk.Frame(self._body, bg=BG)
@@ -891,6 +911,24 @@ class UsageWidget(tk.Tk):
         self._update_state  = state
         self._update_detail = detail
         self._render_update_section()
+
+    def _auto_check_for_update(self) -> None:
+        """Background update check fired once at startup; silent unless an update is found."""
+        if self._update_state != "idle":
+            return
+        threading.Thread(target=self._do_auto_check, daemon=True).start()
+
+    def _do_auto_check(self) -> None:
+        status, detail = check_for_update()
+        if status != "available":
+            return   # stay silent on error/up-to-date
+        def apply():
+            self._update_state  = "available"
+            self._update_detail = detail
+            self._render_update_section()    # in case settings panel is open
+            if self._last_rows:               # re-render body so banner shows
+                self._render(self._last_rows)
+        self._after_safe(0, apply)
 
     def _on_check_update(self) -> None:
         self._set_update_state("checking")
