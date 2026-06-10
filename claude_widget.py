@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -23,6 +25,7 @@ from requests.exceptions import HTTPError
 HOME          = Path.home()
 CREDS_FILE    = HOME / ".claude" / ".credentials.json"
 SETTINGS_FILE = HOME / ".claude_widget_settings.json"
+REPO_DIR      = Path(__file__).resolve().parent
 
 
 # ── Atomic JSON I/O ──────────────────────────────────────────────────────────
@@ -129,6 +132,83 @@ def is_auth_error(exc: BaseException) -> bool:
     if isinstance(exc, HTTPError) and exc.response is not None:
         return exc.response.status_code in (400, 401, 403)
     return False
+
+
+# ── Self-update via git ──────────────────────────────────────────────────────
+
+def _git(*args: str, timeout: int = 15) -> subprocess.CompletedProcess[str]:
+    """Run `git` in the repo directory, capturing stdout/stderr as text."""
+    return subprocess.run(
+        ["git", *args],
+        cwd=REPO_DIR,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        # Hide the console window that would otherwise flash on Windows
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
+def is_git_checkout() -> bool:
+    return (REPO_DIR / ".git").exists()
+
+
+def current_short_sha() -> str:
+    if not is_git_checkout():
+        return "unknown"
+    try:
+        r = _git("rev-parse", "--short", "HEAD")
+        return r.stdout.strip() if r.returncode == 0 else "unknown"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return "unknown"
+
+
+def check_for_update() -> tuple[str, str]:
+    """Return (status, detail). status ∈ {'available', 'current', 'error'}."""
+    if not is_git_checkout():
+        return "error", "Not a git checkout — manual update only"
+    try:
+        fetch = _git("fetch", "--quiet", "origin")
+        if fetch.returncode != 0:
+            return "error", (fetch.stderr or "git fetch failed").strip()
+        local  = _git("rev-parse", "HEAD").stdout.strip()
+        remote = _git("rev-parse", "origin/main").stdout.strip()
+        if not remote:
+            return "error", "Could not resolve origin/main"
+        if local == remote:
+            return "current", ""
+        short = _git("rev-parse", "--short", "origin/main").stdout.strip()
+        return "available", short
+    except FileNotFoundError:
+        return "error", "git not found on PATH"
+    except subprocess.TimeoutExpired:
+        return "error", "git timed out"
+
+
+def install_update() -> str | None:
+    """Run `git pull --ff-only`. Return None on success, error string otherwise."""
+    try:
+        r = _git("pull", "--ff-only", "origin", "main", timeout=30)
+    except FileNotFoundError:
+        return "git not found on PATH"
+    except subprocess.TimeoutExpired:
+        return "git pull timed out"
+    if r.returncode != 0:
+        return (r.stderr or r.stdout or "git pull failed").strip()
+    return None
+
+
+def relaunch_widget() -> None:
+    """Spawn a fresh widget process via the VBS launcher, then exit this one."""
+    vbs = REPO_DIR / "claude_widget.vbs"
+    if vbs.exists():
+        subprocess.Popen(["wscript", str(vbs)], close_fds=True)
+    else:
+        # Fall back to pythonw on the script directly
+        pyw = Path(sys.executable).with_name("pythonw.exe")
+        cmd = [str(pyw if pyw.exists() else sys.executable), str(REPO_DIR / "claude_widget.py")]
+        subprocess.Popen(cmd, close_fds=True)
+    os._exit(0)
 
 
 def retry_after_seconds(exc: BaseException) -> int | None:
@@ -282,6 +362,12 @@ class UsageWidget(tk.Tk):
         self._destroyed   = False
         self._fetch_in_flight = False
         self._next_after_id: str | None = None
+
+        # Self-update state
+        self._version            = current_short_sha()
+        self._update_state       = "idle"   # idle, checking, current, available, installing, error
+        self._update_detail      = ""        # SHA when available, error msg when error
+        self._update_frame: tk.Frame | None = None
 
         self._build_ui()
         self.update_idletasks()
@@ -449,11 +535,14 @@ class UsageWidget(tk.Tk):
         panel = tk.Frame(self._body, bg=BG)
         panel.pack(fill="x", pady=(0, 4))
 
-        self._make_refresh_button(panel).pack(fill="x", pady=(0, 6))
+        self._update_frame = tk.Frame(panel, bg=BG)
+        self._update_frame.pack(fill="x", pady=(0, 8))
+        self._render_update_section()
 
         self._refresh_lbl = tk.Label(
             panel, text=self._fmt_refresh_label(self._refresh_min),
-            bg=BG, fg=FG, font=("Segoe UI", 8))
+            bg=BG, fg=FG, font=("Segoe UI", 8),
+            bd=0, padx=0, pady=0)
         self._refresh_lbl.pack(anchor="w")
 
         scale = tk.Scale(
@@ -467,14 +556,18 @@ class UsageWidget(tk.Tk):
 
         tk.Frame(self._body, bg=SEPARATOR, height=1).pack(fill="x", pady=(0, 4))
 
-    def _make_refresh_button(self, parent: tk.Misc) -> tk.Label:
-        btn = tk.Label(parent, text="↻  Refresh",
+    def _make_action_button(self, parent: tk.Misc, text: str, cb) -> tk.Label:
+        btn = tk.Label(parent, text=text,
                        bg=BTN_BG, fg=FG, font=("Segoe UI", 8),
-                       cursor="hand2", pady=3)
-        btn.bind("<Button-1>", lambda _e: self._manual_refresh())
+                       cursor="hand2", pady=3,
+                       bd=0, padx=0)
+        btn.bind("<Button-1>", lambda _e: cb())
         btn.bind("<Enter>",   lambda _e: btn.config(bg=BTN_BG_HOVER))
         btn.bind("<Leave>",   lambda _e: btn.config(bg=BTN_BG))
         return btn
+
+    def _make_refresh_button(self, parent: tk.Misc) -> tk.Label:
+        return self._make_action_button(parent, "↻  Refresh", self._manual_refresh)
 
     def _toggle_manage(self) -> None:
         self._manage_mode = not self._manage_mode
@@ -524,6 +617,86 @@ class UsageWidget(tk.Tk):
         save_settings(self._settings)
         if hasattr(self, "_refresh_lbl"):
             self._refresh_lbl.config(text=self._fmt_refresh_label(minutes))
+
+    # ── self-update UI ──
+
+    def _render_update_section(self) -> None:
+        frame = self._update_frame
+        if frame is None or not frame.winfo_exists():
+            return
+        for w in frame.winfo_children():
+            w.destroy()
+
+        tk.Label(frame, text=f"Version: {self._version}",
+                 bg=BG, fg=FG_DIM, font=("Segoe UI", 7),
+                 bd=0, padx=0, pady=0).pack(anchor="w")
+
+        state, detail = self._update_state, self._update_detail
+        if state == "idle":
+            self._make_action_button(
+                frame, "Check for updates", self._on_check_update
+            ).pack(fill="x", pady=(2, 0))
+        elif state == "checking":
+            tk.Label(frame, text="Checking…", bg=BG, fg=FG_DIM,
+                     font=("Segoe UI", 8), bd=0, padx=0, pady=0
+                     ).pack(anchor="w", pady=(2, 0))
+        elif state == "current":
+            tk.Label(frame, text="✓ Up to date", bg=BG, fg=BAR_LOW,
+                     font=("Segoe UI", 8), bd=0, padx=0, pady=0
+                     ).pack(anchor="w", pady=(2, 0))
+        elif state == "available":
+            tk.Label(frame, text=f"Update available ({detail})",
+                     bg=BG, fg=FG, font=("Segoe UI", 8),
+                     bd=0, padx=0, pady=0
+                     ).pack(anchor="w", pady=(2, 0))
+            self._make_action_button(
+                frame, "Install update", self._on_install_update
+            ).pack(fill="x", pady=(2, 0))
+        elif state == "installing":
+            tk.Label(frame, text="Installing…", bg=BG, fg=FG_DIM,
+                     font=("Segoe UI", 8), bd=0, padx=0, pady=0
+                     ).pack(anchor="w", pady=(2, 0))
+        elif state == "error":
+            tk.Label(frame, text=detail, bg=BG, fg=BAR_HIGH,
+                     font=("Segoe UI", 7), wraplength=WIDTH - 20,
+                     justify="left", bd=0, padx=0, pady=0
+                     ).pack(anchor="w", pady=(2, 0))
+            self._make_action_button(
+                frame, "Try again", self._on_check_update
+            ).pack(fill="x", pady=(2, 0))
+
+    def _set_update_state(self, state: str, detail: str = "") -> None:
+        self._update_state  = state
+        self._update_detail = detail
+        self._render_update_section()
+
+    def _on_check_update(self) -> None:
+        self._set_update_state("checking")
+        threading.Thread(target=self._do_check_update, daemon=True).start()
+
+    def _do_check_update(self) -> None:
+        status, detail = check_for_update()
+        self._after_safe(0, self._set_update_state, status, detail)
+
+    def _on_install_update(self) -> None:
+        self._set_update_state("installing")
+        threading.Thread(target=self._do_install_update, daemon=True).start()
+
+    def _do_install_update(self) -> None:
+        err = install_update()
+        if err:
+            self._after_safe(0, self._set_update_state, "error", err)
+            return
+        # Pull succeeded — relaunch so the new code takes effect.
+        self._after_safe(0, self._do_relaunch)
+
+    def _do_relaunch(self) -> None:
+        self._destroyed = True
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+        relaunch_widget()
 
     @staticmethod
     def _fmt_refresh_label(minutes: int) -> str:
