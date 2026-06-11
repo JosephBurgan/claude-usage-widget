@@ -461,6 +461,9 @@ class UsageWidget(tk.Tk):
         self._update_detail      = ""        # SHA when available, error msg when error
         self._update_frame: tk.Frame | None = None
 
+        # Settings popup (created on demand when ≡ pressed)
+        self._settings_win: tk.Toplevel | None = None
+
         # Tray state
         self._tray = None  # set by _setup_tray if pystray is available
         self._deps_missing      = not self._has_tray_deps()
@@ -580,6 +583,7 @@ class UsageWidget(tk.Tk):
         """Fully exit: stop tray loop, destroy window."""
         self._save_position()
         self._destroyed = True
+        self._close_settings_window()
         if self._tray is not None:
             try:
                 self._tray.stop()
@@ -604,6 +608,10 @@ class UsageWidget(tk.Tk):
             self.after(150, lambda: self.attributes("-topmost", False))
 
     def _hide_window(self) -> None:
+        self._close_settings_window()
+        if self._manage_mode:
+            self._manage_mode = False
+            self._gear_btn.config(fg=ACCENT)
         self.withdraw()
 
     # ── tray ──────────────────────────────────────────────────────────────────
@@ -732,10 +740,10 @@ class UsageWidget(tk.Tk):
             w.destroy()
 
         if self._manage_mode:
-            self._add_settings_panel()
+            # Settings live in a separate popup; main body just shows every row
+            # with its hide-checkbox so the user can toggle visibility.
             visible = rows
         else:
-            # Settings panel hides the banner so we don't duplicate the call-to-action.
             if self._update_state == "available":
                 self._add_update_banner()
             elif self._deps_missing:
@@ -840,8 +848,8 @@ class UsageWidget(tk.Tk):
         if self._last_rows:
             self._render(self._last_rows)
 
-    def _add_settings_panel(self) -> None:
-        panel = tk.Frame(self._body, bg=BG)
+    def _populate_settings(self, parent: tk.Misc) -> None:
+        panel = tk.Frame(parent, bg=BG)
         panel.pack(fill="x", pady=(0, 4))
 
         self._update_frame = tk.Frame(panel, bg=BG)
@@ -882,8 +890,6 @@ class UsageWidget(tk.Tk):
             get_state=lambda: self._settings.get("remember_position", True),
             set_state=self._set_remember_position,
         )
-
-        tk.Frame(self._body, bg=SEPARATOR, height=1).pack(fill="x", pady=(4, 4))
 
     def _set_minimize_on_close(self, enabled: bool) -> str | None:
         self._settings["minimize_on_close"] = bool(enabled)
@@ -970,8 +976,94 @@ class UsageWidget(tk.Tk):
     def _toggle_manage(self) -> None:
         self._manage_mode = not self._manage_mode
         self._gear_btn.config(fg="white" if self._manage_mode else ACCENT)
+        if self._manage_mode:
+            self._open_settings_window()
+        else:
+            self._close_settings_window()
         if self._last_rows:
             self._render(self._last_rows)
+
+    def _open_settings_window(self) -> None:
+        """Pop a separate Toplevel with the settings UI, clamped on-screen."""
+        if self._settings_win is not None and self._settings_win.winfo_exists():
+            self._settings_win.lift()
+            return
+
+        pop = tk.Toplevel(self)
+        pop.overrideredirect(True)
+        pop.configure(bg=BG)
+        pop.attributes("-topmost", True)
+        pop.attributes("-alpha", 0.93)
+
+        hdr = tk.Frame(pop, bg=BG, cursor="fleur")
+        hdr.pack(fill="x", padx=6, pady=(6, 2))
+        title = tk.Label(hdr, text="Settings", bg=BG, fg=FG,
+                         font=("Segoe UI", 9, "bold"), cursor="fleur")
+        title.pack(side="left")
+        close = self._make_icon_btn(hdr, "✕", self._toggle_manage, size=11)
+        close.pack(side="right", padx=(0, 4))
+
+        drag = {"x": 0, "y": 0}
+        def _ds(e: tk.Event) -> None:
+            drag["x"] = e.x_root - pop.winfo_x()
+            drag["y"] = e.y_root - pop.winfo_y()
+        def _dm(e: tk.Event) -> None:
+            pop.geometry(f"+{e.x_root - drag['x']}+{e.y_root - drag['y']}")
+        for w in (hdr, title):
+            w.bind("<ButtonPress-1>", _ds)
+            w.bind("<B1-Motion>", _dm)
+
+        tk.Frame(pop, bg=SEPARATOR, height=1).pack(fill="x", padx=6, pady=(0, 4))
+
+        body = tk.Frame(pop, bg=BG)
+        body.pack(fill="x", padx=8, pady=(0, 8))
+
+        self._settings_win = pop
+        self._populate_settings(body)
+
+        pop.update_idletasks()
+        pop.geometry(f"{WIDTH}x{pop.winfo_reqheight()}")
+        pop.update_idletasks()
+        self._position_settings_window()
+
+    def _position_settings_window(self) -> None:
+        """Place popup adjacent to widget; fall back through 4 sides, then clamp."""
+        pop = self._settings_win
+        if pop is None or not pop.winfo_exists():
+            return
+        pop.update_idletasks()
+        pw = pop.winfo_width()  or pop.winfo_reqwidth()
+        ph = pop.winfo_height() or pop.winfo_reqheight()
+        sw = pop.winfo_screenwidth()
+        sh = pop.winfo_screenheight()
+        wx, wy = self.winfo_x(), self.winfo_y()
+        ww, wh = self.winfo_width(), self.winfo_height()
+        gap = 4
+
+        candidates = [
+            (wx - pw - gap, wy),           # left of widget (widget is usually bottom-right)
+            (wx + ww + gap, wy),           # right of widget
+            (wx, wy - ph - gap),           # above widget
+            (wx, wy + wh + gap),           # below widget
+        ]
+        for x, y in candidates:
+            if x >= 0 and y >= 0 and x + pw <= sw and y + ph <= sh:
+                pop.geometry(f"+{x}+{y}")
+                return
+        # No side fit cleanly — clamp the left-of placement.
+        x, y = candidates[0]
+        x = max(0, min(x, sw - pw))
+        y = max(0, min(y, sh - ph))
+        pop.geometry(f"+{x}+{y}")
+
+    def _close_settings_window(self) -> None:
+        pop = self._settings_win
+        self._settings_win = None
+        if pop is not None:
+            try:
+                pop.destroy()
+            except tk.TclError:
+                pass
 
     def _toggle_hidden(self, label: str) -> None:
         self._hidden ^= {label}
@@ -1014,7 +1106,10 @@ class UsageWidget(tk.Tk):
         self._settings["refresh_minutes"] = minutes
         save_settings(self._settings)
         if hasattr(self, "_refresh_lbl"):
-            self._refresh_lbl.config(text=self._fmt_refresh_label(minutes))
+            try:
+                self._refresh_lbl.config(text=self._fmt_refresh_label(minutes))
+            except tk.TclError:
+                pass
 
     # ── self-update UI ──
 
@@ -1109,6 +1204,7 @@ class UsageWidget(tk.Tk):
 
     def _do_relaunch(self) -> None:
         self._destroyed = True
+        self._close_settings_window()
         if self._tray is not None:
             try:
                 self._tray.stop()
@@ -1179,11 +1275,8 @@ class UsageWidget(tk.Tk):
                      bd=0, padx=0, pady=0).pack(anchor="w")
 
     def _reset_body(self) -> None:
-        """Clear body and re-add the settings panel if we're in manage mode."""
         for w in self._body.winfo_children():
             w.destroy()
-        if self._manage_mode:
-            self._add_settings_panel()
 
     def _show_login(self) -> None:
         self._reset_body()
